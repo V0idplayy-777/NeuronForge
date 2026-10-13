@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""
+NeuronForge standalone inference runtime (Python / NumPy)
+=========================================================
+
+Runs a model exported from NeuronForge without NeuronForge.
+Requires Python 3.8+ and NumPy. INFERENCE ONLY: no training, no gradients.
+
+The maths mirrors NeuronForge's engine: NHWC layout, the same layer formulas
+(GELU tanh approximation, numerically stable sigmoid, max-shifted softmax),
+Dropout disabled, BatchNorm using running statistics. Intermediate results are
+rounded to float32 at the same layer boundaries as the browser engine.
+NumPy's matrix multiply accumulates in a different order than the JavaScript
+loops, so results agree to within a small tolerance rather than bit-for-bit.
+
+Usage:
+    from neuronforge_model import load_model
+    model = load_model()                 # reads bundle.json next to this file
+    print(model.predict([0.25, 0.75]))
+    print(model.verify())
+
+Command line:
+    python neuronforge_model.py --info
+    python neuronforge_model.py --verify
+    python neuronforge_model.py --predict 0.25,0.75
+    python neuronforge_model.py --generate "hello there" --max-tokens 40
+"""
+from __future__ import annotations
+
+import base64
+import json
+import math
+import os
+import random
+import re
+import sys
+
+import numpy as np
+
+RUNTIME_VERSION = "1.0.0"
+BUNDLE_FORMAT = "neuronforge-standalone"
+BUNDLE_VERSION = 1
+SUPPORTED_LAYERS = (
+    "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
+    "gap2d", "embedding", "rnn", "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
+)
+ACTIVATION_LAYERS = ("relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax")
+F32 = np.float32
+F64 = np.float64
+_M32 = 0xFFFFFFFF
+
+
+# --------------------------------------------------------------------------- helpers
+
+def _num(v, d):
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return d
+    return n if math.isfinite(n) else d
+
+
+def _int(v, d):
+    return int(_num(v, d))
+
+
+def _bool(v, d):
+    return v if isinstance(v, bool) else d
+
+
+def _kernel(v):
+    if isinstance(v, (list, tuple)) and len(v) >= 2:
+        return int(v[0]), int(v[1])
+    n = _int(v, 3)
+    return n, n
+
+
+def _padding(c):
+    p = c.get("padding")
+    return "same" if p is None else str(p)
+
+
+def _act_name(c):
+    a = c.get("activation")
+    return "none" if a is None else str(a)
+
+
+def _numel(shape):
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return n
+
+
+def _checksum(key: str, data: bytes) -> str:
+    """Checksum over utf8(key) + tensor bytes; identical to the JS runtime."""
+    arr = np.frombuffer(key.encode("utf-8") + data, dtype=np.uint8).astype(np.uint64)
+    s1 = int(arr.sum()) % 2 ** 32
+    w = (np.arange(arr.size, dtype=np.uint64) % np.uint64(65521)) + np.uint64(1)
+    s2 = int((arr * w).sum()) % 2 ** 32
+    return f"{s1:08x}{s2:08x}"
+
+
+def _decode_tensor(entry, key, check_sums):
+    if not entry or not isinstance(entry.get("data"), str):
+        raise ValueError(f"Missing weight tensor '{key}'")
+    raw = base64.b64decode(entry["data"])
+    shape = [int(s) for s in entry["shape"]]
+    n = _numel(shape)
+    if len(raw) != n * 4:
+        raise ValueError(f"Weight tensor '{key}' has {len(raw)} bytes but shape {shape} needs {n * 4}")
+    if check_sums and entry.get("checksum") and _checksum(key, raw) != entry["checksum"]:
+        raise ValueError(f"Checksum mismatch for weight tensor '{key}': bundle corrupted, edited, or tensor on the wrong layer")
+    return np.frombuffer(raw, dtype="<f4").astype(F32).reshape(shape)
+
+
+# --------------------------------------------------------------------------- shapes
+
+def _conv_geom(H, W, kH, kW, stride, padding):
+    if padding == "same":
+        oh = math.ceil(H / stride)
+        ow = math.ceil(W / stride)
+        return oh, ow, max(0, (oh - 1) * stride + kH - H), max(0, (ow - 1) * stride + kW - W)
+    return (H - kH) // stride + 1, (W - kW) // stride + 1, 0, 0
+
+
+def _infer_shape(t, c, s, name):
+    def fail(msg):
+        raise ValueError(f"Layer '{name}' ({t}): {msg}")
+
+    if t == "dense":
+        if len(s) != 1:
+            fail(f"expects rank-1 input, got {s}")
+        return [_int(c.get("units"), 8)]
+    if t == "flatten":
+        return [_numel(s)]
+    if t == "reshape":
+        target = [int(v) for v in c.get("targetShape", [1])]
+        if _numel(target) != _numel(s):
+            fail(f"cannot reshape {s} to {target}")
+        return target
+    if t in ("dropout", "batchnorm", "layernorm", "identity") + ACTIVATION_LAYERS:
+        return list(s)
+    if t == "conv2d":
+        if len(s) != 3:
+            fail(f"expects [H, W, C], got {s}")
+        kH, kW = _kernel(c.get("kernelSize"))
+        oh, ow, _, _ = _conv_geom(s[0], s[1], kH, kW, _int(c.get("stride"), 1), _padding(c))
+        return [oh, ow, _int(c.get("filters"), 8)]
+    if t in ("maxpool2d", "avgpool2d"):
+        if len(s) != 3:
+            fail(f"expects [H, W, C], got {s}")
+        p = _int(c.get("poolSize"), 2)
+        st = _int(c.get("stride"), p)
+        oh = (s[0] - p) // st + 1
+        ow = (s[1] - p) // st + 1
+        if oh <= 0 or ow <= 0:
+            fail(f"pool {p}x{p} does not fit {s}")
+        return [oh, ow, s[2]]
+    if t == "gap2d":
+        if len(s) != 3:
+            fail(f"expects [H, W, C], got {s}")
+        return [s[2]]
+    if t == "embedding":
+        if len(s) != 1:
+            fail(f"expects [seqLen], got {s}")
+        return [s[0], _int(c.get("embeddingDim"), 8)]
+    if t == "rnn":
+        if len(s) != 2:
+            fail(f"expects [seqLen, features], got {s}")
+        u = _int(c.get("units"), 32)
+        return [s[0], u] if _bool(c.get("returnSequences"), False) else [u]
+    raise ValueError(f"Unsupported layer type '{t}' in layer '{name}'")
+
+
+def _expected_params(t, c, s, out):
+    if t == "dense":
+        p = {"W": [s[0], out[0]]}
+        if _bool(c.get("useBias"), True):
+            p["b"] = [out[0]]
+        return p
+    if t == "conv2d":
+        kH, kW = _kernel(c.get("kernelSize"))
+        p = {"K": [kH, kW, s[2], out[2]]}
+        if _bool(c.get("useBias"), True):
+            p["b"] = [out[2]]
+        return p
+    if t == "batchnorm":
+        f = s[-1]
+        return {"gamma": [f], "beta": [f], "runningMean": [f], "runningVar": [f]}
+    if t == "layernorm":
+        f = s[-1]
+        return {"gamma": [f], "beta": [f]}
+    if t == "embedding":
+        return {"W": [_int(c.get("vocabSize"), 32), out[1]]}
+    if t == "rnn":
+        h = _int(c.get("units"), 32)
+        return {"Wxh": [s[1], h], "Whh": [h, h], "b": [h]}
+    return {}
+
+
+# --------------------------------------------------------------------------- ops
+
+def _sigmoid(x):
+    xd = x.astype(F64)
+    out = np.empty_like(xd)
+    pos = xd >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-xd[pos]))
+    e = np.exp(xd[~pos])
+    out[~pos] = e / (1.0 + e)
+    return out.astype(F32)
+
+
+def _softmax(x):
+    xd = x.astype(F64)
+    m = xd.max(axis=-1, keepdims=True)
+    ed = np.exp(xd - m)
+    s = ed.sum(axis=-1, keepdims=True)
+    s = np.where(s == 0, 1e-12, s)
+    # NeuronForge stores exp() in float32 before scaling by 1/sum (sum of unrounded values).
+    return (ed.astype(F32).astype(F64) * (1.0 / s)).astype(F32)
+
+
+def _activation(name, x, alpha=0.01):
+    if name == "linear":
+        return x
+    if name == "relu":
+        return np.where(x > 0, x, 0).astype(F32)
+    if name == "leakyrelu":
+        return np.where(x > 0, x.astype(F64), alpha * x.astype(F64)).astype(F32)
+    if name == "sigmoid":
+        return _sigmoid(x)
+    if name == "tanh":
+        return np.tanh(x.astype(F64)).astype(F32)
+    if name == "gelu":
+        c = math.sqrt(2.0 / math.pi)
+        v = x.astype(F64)
+        return (0.5 * v * (1.0 + np.tanh(c * (v + 0.044715 * v * v * v)))).astype(F32)
+    if name == "silu":
+        return (x.astype(F64) * _sigmoid(x).astype(F64)).astype(F32)
+    if name == "softmax":
+        return _softmax(x)
+    raise ValueError(f"Unsupported activation '{name}'")
+
+
+def _compile(d, c, s, out, P):
+    t = d["type"]
+    name = d.get("name", t)
+
+    if t == "dense":
+        din = s[0]
+        use_bias = _bool(c.get("useBias"), True)
+        act = _act_name(c)
+        W = P["W"].astype(F64)
+        b = P["b"].astype(F64) if use_bias else None
+
+        def f(x):
+            if x.ndim != 2 or x.shape[1] != din:
+                raise ValueError(f"Dense '{name}': expected [B, {din}], got {list(x.shape)}")
+            y = (x.astype(F64) @ W).astype(F32)
+            if use_bias:
+                y = (y.astype(F64) + b).astype(F32)
+            if act != "none":
+                y = _activation(act, y, 0.01)
+            return y
+        return f
+
+    if t == "flatten":
+        return lambda x: x.reshape(x.shape[0], -1)
+    if t == "reshape":
+        return lambda x: x.reshape((x.shape[0],) + tuple(out))
+    if t in ("dropout", "identity"):
+        return lambda x: x  # Dropout is disabled at inference, as in NeuronForge evaluation.
+    if t in ACTIVATION_LAYERS:
+        alpha = _num(c.get("alpha"), 0.01)
+        return lambda x: _activation(t, x, alpha)
+
+    if t == "batchnorm":
+        eps = _num(c.get("epsilon"), 1e-5)
+        g, bt = P["gamma"].astype(F64), P["beta"].astype(F64)
+        rm, rv = P["runningMean"].astype(F64), P["runningVar"].astype(F64)
+        return lambda x: (g * ((x.astype(F64) - rm) / np.sqrt(rv + eps)) + bt).astype(F32)
+
+    if t == "layernorm":
+        eps = _num(c.get("epsilon"), 1e-5)
+        g, bt = P["gamma"].astype(F64), P["beta"].astype(F64)
+
+        def f(x):
+            xd = x.astype(F64)
+            m = xd.mean(axis=-1, keepdims=True)
+            v = ((xd - m) ** 2).mean(axis=-1, keepdims=True)
+            std = np.sqrt(v + eps).astype(F32).astype(F64)
+            return (g * ((xd - m) / std) + bt).astype(F32)
+        return f
+
+    if t == "conv2d":
+        H, W_, C = s
+        oh, ow, F = out
+        kH, kW = _kernel(c.get("kernelSize"))
+        stride = _int(c.get("stride"), 1)
+        _, _, pad_h, pad_w = _conv_geom(H, W_, kH, kW, stride, _padding(c))
+        pt, pl = pad_h // 2, pad_w // 2
+        K = P["K"].astype(F64)
+        b = P["b"].astype(F64) if _bool(c.get("useBias"), True) else None
+        act = _act_name(c)
+
+        def f(x):
+            B = x.shape[0]
+            xp = np.zeros((B, H + pad_h, W_ + pad_w, C), dtype=F64)
+            xp[:, pt:pt + H, pl:pl + W_, :] = x
+            y = np.zeros((B, oh, ow, F), dtype=F64)
+            for kh in range(kH):
+                for kw in range(kW):
+                    patch = xp[:, kh:kh + stride * (oh - 1) + 1:stride, kw:kw + stride * (ow - 1) + 1:stride, :]
+                    y += patch @ K[kh, kw]
+            if b is not None:
+                y += b
+            y = y.astype(F32)
+            if act != "none":
+                y = _activation(act, y, 0.01)
+            return y
+        return f
+
+    if t in ("maxpool2d", "avgpool2d"):
+        p = _int(c.get("poolSize"), 2)
+        st = _int(c.get("stride"), p)
+        oh, ow = out[0], out[1]
+        is_max = t == "maxpool2d"
+
+        def f(x):
+            acc = None
+            for kh in range(p):
+                for kw in range(p):
+                    win = x[:, kh:kh + st * (oh - 1) + 1:st, kw:kw + st * (ow - 1) + 1:st, :].astype(F64)
+                    if acc is None:
+                        acc = win.copy()
+                    elif is_max:
+                        acc = np.maximum(acc, win)
+                    else:
+                        acc = acc + win
+            return (acc if is_max else acc / (p * p)).astype(F32)
+        return f
+
+    if t == "gap2d":
+        return lambda x: x.astype(F64).mean(axis=(1, 2)).astype(F32)
+
+    if t == "embedding":
+        vocab = _int(c.get("vocabSize"), 32)
+        Wt = P["W"]
+
+        def f(x):
+            B = x.shape[0]
+            ids = np.floor(x.astype(F64).reshape(B, -1) + 0.5)  # Math.round semantics
+            ids = np.nan_to_num(ids, nan=0.0)
+            ids = np.clip(ids, 0, vocab - 1).astype(np.int64)
+            return Wt[ids].astype(F32)
+        return f
+
+    if t == "rnn":
+        units = _int(c.get("units"), 32)
+        ret = _bool(c.get("returnSequences"), False)
+        Wxh, Whh, b = P["Wxh"].astype(F64), P["Whh"].astype(F64), P["b"].astype(F64)
+
+        def f(x):
+            B, T, _ = x.shape
+            h = np.zeros((B, units), dtype=F64)
+            seq = []
+            xd = x.astype(F64)
+            for step in range(T):
+                h = np.tanh(xd[:, step, :] @ Wxh + h @ Whh + b).astype(F32).astype(F64)
+                if ret:
+                    seq.append(h)
+            return (np.stack(seq, axis=1) if ret else h).astype(F32)
+        return f
+
+    raise ValueError(f"Unsupported layer type '{t}'")
+
+
+# --------------------------------------------------------------------------- tokenizer + sampling
+
+_WORD_RE = re.compile(r"[a-z0-9]+|[^\sa-z0-9]")
+
+
+def tokenize_words(text):
+    return _WORD_RE.findall(str(text).lower())
+
+
+def join_words(words):
+    if not words:
+        return ""
+    s = words[0]
+    for w in words[1:]:
+        if (len(w) == 1 and w in ",.;:!?)]}") or w in ("n't", "'s"):
+            s += w
+        else:
+            s += " " + w
+    return s
+
+
+class RNG:
+    """Mulberry32, bit-identical to NeuronForge's generator."""
+
+    def __init__(self, seed):
+        self.s = (int(seed) & _M32) or 1
+
+    def next(self):
+        self.s = (self.s + 0x6D2B79F5) & _M32
+        t = self.s
+        t = ((t ^ (t >> 15)) * (t | 1)) & _M32
+        t = t ^ ((t + (((t ^ (t >> 7)) * (t | 61)) & _M32)) & _M32)
+        return ((t ^ (t >> 14)) & _M32) / 4294967296
+
+
+def _top_k_indices(logits, k):
+    n = len(logits)
+    stride = max(1, n // 512)
+    sample = sorted((logits[i] for i in range(0, n, stride)), reverse=True)
+    threshold = sample[min(k - 1, len(sample) - 1)]
+    idx = [i for i in range(n) if logits[i] >= threshold]
+    if len(idx) > k:
+        idx.sort(key=lambda i: -logits[i])
+        idx = idx[:k]
+    return idx
+
+
+def sample_from_probs(probs, temperature, top_k, rng):
+    """Temperature + top-k sampling, same algorithm as the NeuronForge sampler."""
+    n = len(probs)
+    if n == 0:
+        raise ValueError("Cannot sample from an empty distribution")
+
+    def argmax():
+        best = 0
+        for i in range(1, n):
+            if probs[i] > probs[best]:
+                best = i
+        return best
+
+    if not math.isfinite(temperature) or temperature <= 0.01:
+        return argmax()
+    inv_t = 1.0 / temperature
+    logits = [math.log(max(float(p), 1e-9)) * inv_t for p in probs]
+    k = max(1, min(int(math.floor(top_k)) or n, n))
+    cand = list(range(n)) if k >= n else _top_k_indices(logits, k)
+    mx = max(logits[i] for i in cand)
+    weights = [math.exp(logits[i] - mx) for i in cand]
+    total = sum(weights)
+    if not total > 0:
+        return argmax()
+    r = rng.next() * total
+    for i, w in zip(cand, weights):
+        r -= w
+        if r <= 0:
+            return i
+    return cand[-1]
+
+
+# --------------------------------------------------------------------------- model
+
+class StandaloneModel:
+    def __init__(self, bundle, verify_checksums=True):
+        if isinstance(bundle, str):
+            bundle = json.loads(bundle)
+        if not isinstance(bundle, dict) or bundle.get("format") != BUNDLE_FORMAT:
+            raise ValueError("Not a NeuronForge standalone bundle")
+        if bundle.get("formatVersion") != BUNDLE_VERSION:
+            raise ValueError(f"Bundle format version {bundle.get('formatVersion')} not supported by runtime {RUNTIME_VERSION}")
+        self.bundle = bundle
+        arch = bundle["architecture"]
+        weights = bundle.get("weights", {})
+        self.layers = []
+        self.layer_info = []
+        self.weights = {}
+        used = set()
+        shape = [int(v) for v in arch["inputShape"]]
+        self.param_count = 0
+        for idx, d in enumerate(arch["layers"]):
+            t = d["type"]
+            if t not in SUPPORTED_LAYERS:
+                raise ValueError(f"Unsupported layer type '{t}' (layer {idx + 1}, '{d.get('name')}'). "
+                                 f"Runtime {RUNTIME_VERSION} supports: {', '.join(SUPPORTED_LAYERS)}")
+            c = d.get("config") or {}
+            if t in ("dense", "conv2d") and _act_name(c) not in ("none", "linear") + ACTIVATION_LAYERS:
+                raise ValueError(f"Layer '{d.get('name')}' uses unsupported fused activation '{_act_name(c)}'")
+            out = _infer_shape(t, c, shape, d.get("name"))
+            if "inputShape" in d and [int(v) for v in d["inputShape"]] != shape:
+                raise ValueError(f"Shape check failed at '{d.get('name')}': bundle input {d['inputShape']} vs computed {shape}")
+            if "outputShape" in d and [int(v) for v in d["outputShape"]] != out:
+                raise ValueError(f"Shape check failed at '{d.get('name')}': bundle output {d['outputShape']} vs computed {out}")
+            P = {}
+            for pname, eshape in _expected_params(t, c, shape, out).items():
+                key = f"{d['id']}.{pname}"
+                entry = weights.get(key)
+                if entry is None:
+                    raise ValueError(f"Missing weight tensor '{key}' for layer '{d.get('name')}' ({t})")
+                if entry.get("dtype", "float32") != "float32":
+                    raise ValueError(f"Weight '{key}' dtype {entry.get('dtype')} unsupported")
+                if [int(v) for v in entry["shape"]] != [int(v) for v in eshape]:
+                    raise ValueError(f"Weight '{key}' has shape {entry['shape']} but layer needs {eshape}")
+                P[pname] = _decode_tensor(entry, key, verify_checksums)
+                self.weights[key] = P[pname]
+                used.add(key)
+                self.param_count += P[pname].size
+            self.layers.append(_compile(d, c, shape, out, P))
+            self.layer_info.append({"name": d.get("name"), "type": t, "inputShape": list(shape), "outputShape": list(out)})
+            shape = out
+        unused = sorted(set(weights) - used)
+        if unused:
+            raise ValueError(f"Weight tensor(s) not used by any layer: {unused}")
+
+        self.input_shape = [int(v) for v in arch["inputShape"]]
+        self.output_shape = shape
+        self.in_size = _numel(self.input_shape)
+        self.task = bundle.get("task", "raw")
+        self.output = bundle.get("output") or {}
+        self.tokenizer = bundle.get("tokenizer")
+        self.preprocessing = bundle.get("preprocessing")
+        self.image = bundle.get("image")
+        self.sampling = bundle.get("sampling") or {"temperature": 0.7, "topK": 50}
+        self._stoi = {}
+        self._pad_id = 0
+        if self.tokenizer:
+            for i, tkn in enumerate(self.tokenizer["tokens"]):
+                self._stoi[tkn] = i
+            self._pad_id = self._stoi.get(self.tokenizer.get("padToken"), 0)
+            if self.task == "language" and len(self.tokenizer["tokens"]) != _numel(self.output_shape):
+                raise ValueError("Tokenizer size does not match the model's output classes")
+
+    # ---- core ----
+    def forward(self, x):
+        """Run the network on a batch shaped [B, *input_shape]. Returns float32 ndarray."""
+        x = np.asarray(x, dtype=F32)
+        if list(x.shape[1:]) != self.input_shape:
+            x = x.reshape((-1,) + tuple(self.input_shape))
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def _label(self, i):
+        names = self.output.get("classNames")
+        return str(names[i]) if names and i < len(names) else str(i)
+
+    # ---- preprocessing ----
+    def encode(self, row):
+        pp = self.preprocessing
+        if not pp or pp.get("kind") != "tabular":
+            raise ValueError("This model has no tabular preprocessing; pass numeric features directly")
+        cols = pp["columns"]
+        if isinstance(row, (list, tuple)) and len(row) != len(cols):
+            raise ValueError(f"Expected {len(cols)} raw values ({', '.join(c['name'] for c in cols)}), got {len(row)}")
+        vec = []
+        for i, col in enumerate(cols):
+            v = row[i] if isinstance(row, (list, tuple)) else (row or {}).get(col["name"])
+            if col["type"] == "numeric":
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    num = float(v) if math.isfinite(float(v)) else float("nan")
+                else:
+                    raw = "" if v is None else str(v).strip()
+                    try:
+                        num = float(raw) if raw != "" else float("nan")
+                    except ValueError:
+                        num = float("nan")
+                    if not math.isfinite(num):
+                        num = float("nan")
+                if math.isnan(num) and pp["missing"] == "drop":
+                    raise ValueError(f"Column '{col['name']}' is missing or not numeric and the model was trained with policy 'drop'")
+                vec.append(num)
+            else:
+                s = "" if v is None else str(v).strip()
+                cats = col["categories"]
+                if col["encoding"] == "label":
+                    vec.append(0 if s == "" else (cats.index(s) if s in cats else 0))
+                else:
+                    oh = [0.0] * max(1, len(cats))
+                    if s in cats:
+                        oh[cats.index(s)] = 1.0
+                    vec.extend(oh)
+        out = []
+        for j, v in enumerate(vec):
+            x = v if math.isfinite(v) else (0.0 if pp["missing"] == "zero" else pp["mean"][j])
+            if pp["normalize"] == "minmax":
+                d = (pp["max"][j] - pp["min"][j]) or 1.0
+                x = (x - pp["min"][j]) / d
+            elif pp["normalize"] == "zscore":
+                x = (x - pp["mean"][j]) / (pp["std"][j] or 1.0)
+            out.append(x)
+        return out
+
+    # ---- tokenizer ----
+    def tokenize(self, text):
+        if not self.tokenizer:
+            raise ValueError("This model was not exported with a tokenizer")
+        if self.tokenizer["level"] == "word":
+            return [self._stoi.get(w, 0) for w in tokenize_words(text)]
+        return [self._stoi[ch] for ch in str(text).lower() if ch in self._stoi]
+
+    def detokenize(self, ids):
+        toks = self.tokenizer["tokens"]
+        parts = [toks[i] for i in ids if 0 <= i < len(toks)]
+        return join_words(parts) if self.tokenizer["level"] == "word" else "".join(parts)
+
+    def _window(self, ids):
+        seq = self.input_shape[0]
+        w = list(ids[-seq:])
+        return [self._pad_id] * (seq - len(w)) + w
+
+    def _prepare(self, x, preprocessed=False):
+        if self.task == "language" and isinstance(x, str):
+            ids = self.tokenize(x)
+            if not ids:
+                raise ValueError("The text contains no tokens from the vocabulary")
+            return self._window(ids)
+        pp = self.preprocessing
+        if pp and pp.get("kind") == "tabular" and not preprocessed and isinstance(x, (dict, list, tuple)):
+            return self.encode(x)
+        flat = np.asarray(x, dtype=F64).reshape(-1).tolist()
+        if len(flat) != self.in_size:
+            raise ValueError(f"Expected {self.in_size} values for input shape {self.input_shape}, got {len(flat)}")
+        return flat
+
+    def _interpret(self, raw, flat):
+        raw = [float(v) for v in raw]
+        t = self.task
+        if t == "binary":
+            p = raw[0]
+            cls = 1 if p >= 0.5 else 0
+            return {"task": t, "predicted": cls, "label": self._label(cls),
+                    "probability": p if self.output.get("outputsAreProbabilities") else None, "score": p, "raw": raw}
+        if t == "multiclass":
+            best = int(np.argmax(raw))
+            order = sorted(range(len(raw)), key=lambda k: -raw[k])[:5]
+            return {"task": t, "predicted": best, "label": self._label(best),
+                    "probabilities": raw if self.output.get("outputsAreProbabilities") else None, "scores": raw,
+                    "top": [{"index": k, "label": self._label(k), "value": raw[k]} for k in order], "raw": raw}
+        if t == "regression":
+            names = self.output.get("targetNames") or []
+            return {"task": t, "value": raw[0], "values": raw, "named": dict(zip(names, raw)), "raw": raw}
+        if t == "reconstruction":
+            err = float(np.mean((np.asarray(raw) - np.asarray(flat, dtype=F64)) ** 2)) if raw else 0.0
+            return {"task": t, "reconstruction": raw, "reconstructionError": err, "raw": raw}
+        if t == "language":
+            order = sorted(range(len(raw)), key=lambda k: -raw[k])[:10]
+            top = [{"id": k, "token": self.tokenizer["tokens"][k], "probability": raw[k]} for k in order]
+            return {"task": t, "next": top[0]["token"] if top else None, "top": top, "raw": raw}
+        return {"task": "raw", "output": raw, "shape": self.output_shape, "raw": raw}
+
+    def predict(self, x, preprocessed=False):
+        flat = self._prepare(x, preprocessed)
+        out = self.forward(np.asarray([flat], dtype=F32))
+        return self._interpret(out.reshape(-1), flat)
+
+    def predict_batch(self, xs, preprocessed=False):
+        flats = [self._prepare(x, preprocessed) for x in xs]
+        out = self.forward(np.asarray(flats, dtype=F32)).reshape(len(flats), -1)
+        return [self._interpret(o, f) for o, f in zip(out, flats)]
+
+    def next_token(self, text):
+        return self.predict(str(text))
+
+    def generate_detailed(self, prompt, max_tokens=60, temperature=None, top_k=None, seed=None, stop=None, stop_at_eos=True):
+        if not self.tokenizer or self.task != "language":
+            raise ValueError("generate() is only available for language models")
+        temperature = self.sampling["temperature"] if temperature is None else float(temperature)
+        top_k = self.sampling["topK"] if top_k is None else int(top_k)
+        seed = random.getrandbits(32) if seed is None else int(seed)
+        if stop is None:
+            stop = [self.tokenizer["eos"]] if stop_at_eos and self.tokenizer.get("eos") else []
+        prompt_ids = self.tokenize(prompt)
+        if not prompt_ids:
+            raise ValueError("The prompt contains no tokens from the vocabulary")
+        rng = RNG(seed)
+        ctx = list(prompt_ids)
+        ids = []
+        stopped_by = None
+        toks = self.tokenizer["tokens"]
+        for _ in range(int(max_tokens)):
+            probs = self.forward(np.asarray([self._window(ctx)], dtype=F32)).reshape(-1)
+            idx = sample_from_probs(probs, temperature, top_k, rng)
+            if toks[idx] in stop:
+                stopped_by = toks[idx]
+                break
+            ids.append(idx)
+            ctx.append(idx)
+        text = self.detokenize(ids)
+        if self.tokenizer["level"] == "word":
+            full = str(prompt).strip() + ("" if not text or text[0] in ",.;:!?)]}" else " ") + text
+        else:
+            full = str(prompt) + text
+        return {"text": text, "fullText": full, "ids": ids, "tokens": [toks[i] for i in ids], "promptIds": prompt_ids,
+                "stoppedBy": stopped_by, "settings": {"maxTokens": max_tokens, "temperature": temperature, "topK": top_k, "seed": seed}}
+
+    def generate(self, prompt, max_tokens=60, temperature=None, top_k=None, seed=None, stop=None, include_prompt=False):
+        r = self.generate_detailed(prompt, max_tokens, temperature, top_k, seed, stop)
+        return r["fullText"] if include_prompt else r["text"]
+
+    def image_to_input(self, pixels, width=None, height=None, channels=None, scale=None, invert=False):
+        spec = self.image
+        if not spec:
+            raise ValueError("This model was not exported with an image specification")
+        W, H, C = spec["width"], spec["height"], spec["channels"]
+        src = np.asarray(pixels)
+        if src.ndim == 3:
+            height, width, channels = src.shape
+        sw, sh = width or W, height or H
+        flat = src.reshape(-1).astype(F64)
+        sc = channels or (4 if flat.size == sw * sh * 4 else 3 if flat.size == sw * sh * 3 else 1 if flat.size == sw * sh else 0)
+        if not sc:
+            raise ValueError(f"Cannot infer channels: {flat.size} values for a {sw}x{sh} image")
+        if scale is None:
+            scale = 1 / 255 if src.dtype == np.uint8 else 1.0
+        lo, hi = spec["range"]
+        out = []
+        for y in range(H):
+            for x in range(W):
+                sx = min(sw - 1, (x * sw) // W)
+                sy = min(sh - 1, (y * sh) // H)
+                base = (sy * sw + sx) * sc
+                for ch in range(C):
+                    if C == 1:
+                        v = flat[base:base + 3].mean() if sc >= 3 else flat[base]
+                    else:
+                        v = flat[base + min(ch, sc - 1)]
+                    v *= scale
+                    if invert:
+                        v = 1 - v
+                    out.append(lo + v * (hi - lo))
+        return out
+
+    def predict_image(self, pixels, **kw):
+        flat = self.image_to_input(pixels, **kw)
+        return self._interpret(self.forward(np.asarray([flat], dtype=F32)).reshape(-1), flat)
+
+    # ---- verification ----
+    def verify(self):
+        tests = self.bundle.get("tests") or {}
+        # NumPy accumulates in a different order than the JS loops: allow a slightly wider tolerance.
+        atol, rtol = 1e-4, 1e-3
+        checks = []
+        for i, tc in enumerate(tests.get("forward", [])):
+            try:
+                got = self.forward(np.asarray([tc["input"]], dtype=F32)).reshape(-1).astype(F64)
+                exp = np.asarray(tc["output"], dtype=F64)
+                if got.shape != exp.shape:
+                    checks.append((f"forward #{i + 1}", "fail", f"output length {got.size} != {exp.size}"))
+                    continue
+                diff = np.abs(got - exp)
+                bad = int(np.sum(diff > atol + rtol * np.abs(exp)))
+                checks.append((f"forward #{i + 1}", "fail" if bad else "pass",
+                               f"max |diff| = {diff.max():.2e}" + (f", {bad} values outside tolerance" if bad else "")))
+            except Exception as e:  # noqa: BLE001
+                checks.append((f"forward #{i + 1}", "fail", str(e)))
+        for i, tc in enumerate(tests.get("tokenizer", [])):
+            ok = self.tokenize(tc["text"]) == tc["ids"]
+            checks.append((f"tokenizer #{i + 1}", "pass" if ok else "fail", "ids match" if ok else "ids differ"))
+        for i, tc in enumerate(tests.get("generation", [])):
+            try:
+                r = self.generate_detailed(tc["prompt"], tc["maxTokens"], tc["temperature"], tc["topK"], tc["seed"], stop=[])
+                same = r["ids"] == tc["ids"]
+                checks.append((f"generation #{i + 1}", "pass" if same else "warn",
+                               "identical tokens" if same else "sampled tokens diverged (expected occasionally: float differences can flip a sampling tie)"))
+            except Exception as e:  # noqa: BLE001
+                checks.append((f"generation #{i + 1}", "fail", str(e)))
+        for i, tc in enumerate(tests.get("preprocessing", [])):
+            try:
+                enc = np.asarray(self.encode(tc["raw"]), dtype=F64)
+                exp = np.asarray(tc["encoded"], dtype=F64)
+                ok = enc.shape == exp.shape and bool(np.all(np.abs(enc - exp) <= 1e-9 + 1e-7 * np.abs(exp)))
+                checks.append((f"preprocessing #{i + 1}", "pass" if ok else "fail", "encoding matches" if ok else "encoding differs"))
+            except Exception as e:  # noqa: BLE001
+                checks.append((f"preprocessing #{i + 1}", "fail", str(e)))
+        return {"ok": all(c[1] != "fail" for c in checks), "runtimeVersion": RUNTIME_VERSION,
+                "checks": [{"name": n, "status": s, "detail": d} for n, s, d in checks]}
+
+    @property
+    def info(self):
+        return {"name": self.bundle.get("name"), "task": self.task, "inputShape": self.input_shape,
+                "outputShape": self.output_shape, "paramCount": self.param_count, "layers": self.layer_info,
+                "tokenizer": None if not self.tokenizer else {"level": self.tokenizer["level"],
+                                                              "vocabSize": len(self.tokenizer["tokens"]),
+                                                              "seqLen": self.tokenizer["seqLen"]},
+                "limitations": self.bundle.get("limitations", []), "runtimeVersion": RUNTIME_VERSION}
+
+
+def load_model(path=None, verify_checksums=True):
+    """Load bundle.json (default: next to this file) and return a StandaloneModel."""
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundle.json")
+    with open(path, "r", encoding="utf-8") as fh:
+        return StandaloneModel(json.load(fh), verify_checksums=verify_checksums)
+
+
+def _main(argv):
+    import argparse
+    ap = argparse.ArgumentParser(description="NeuronForge standalone model")
+    ap.add_argument("--bundle", default=None, help="path to bundle.json")
+    ap.add_argument("--info", action="store_true")
+    ap.add_argument("--verify", action="store_true", help="run the test vectors embedded by NeuronForge")
+    ap.add_argument("--predict", help="comma-separated input values")
+    ap.add_argument("--generate", help="prompt for language models")
+    ap.add_argument("--max-tokens", type=int, default=60)
+    ap.add_argument("--temperature", type=float, default=None)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    a = ap.parse_args(argv)
+    m = load_model(a.bundle)
+    if a.info:
+        print(json.dumps(m.info, indent=2))
+    if a.verify:
+        rep = m.verify()
+        for c in rep["checks"]:
+            print(f"[{c['status'].upper():4}] {c['name']}: {c['detail']}")
+        print("OK" if rep["ok"] else "FAILED")
+        if not rep["ok"]:
+            return 1
+    if a.predict:
+        vals = [v.strip() for v in a.predict.split(",")]
+        if not (m.preprocessing and m.preprocessing.get("kind") == "tabular"):
+            vals = [float(v) for v in vals]
+        print(json.dumps(m.predict(vals), indent=2))
+    if a.generate is not None:
+        print(m.generate(a.generate, a.max_tokens, a.temperature, a.top_k, a.seed, include_prompt=True))
+    if not (a.info or a.verify or a.predict or a.generate is not None):
+        ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))
