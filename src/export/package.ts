@@ -99,7 +99,16 @@ function ioSection(b: StandaloneBundle): string {
   if (b.tokenizer) {
     const t = b.tokenizer;
     lines.push(`- **Tokenizer:** ${t.level}-level, ${t.tokens.length.toLocaleString()} tokens, context ${t.seqLen}, pad token \`${JSON.stringify(t.padToken)}\`${t.eos ? `, end-of-sequence \`${JSON.stringify(t.eos)}\`` : ", no end-of-sequence token"}`);
-    lines.push(t.level === "word" ? "  - Text is lowercased and split into words + punctuation; unknown words become `<unk>` (id 0)." : "  - Text is lowercased; characters outside the vocabulary are skipped.");
+    const ruleNote = (t.merges ?? 0).toLocaleString();
+    lines.push(
+      t.level === "word"
+        ? "  - Text is lowercased and split into words + punctuation; unknown words become the `<unk>` token (id 0)."
+        : t.level === "bpe"
+          ? "  - Text is lowercased and split into whitespace / non-whitespace runs. The " +
+            ruleNote +
+            " learned BPE merge rules are re-applied, so subword tokenisation matches training exactly; unseen characters become the `<unk>` token (id 0)."
+          : "  - Text is lowercased; characters outside the vocabulary are skipped.",
+    );
     lines.push(`  - Prompts longer than ${t.seqLen} tokens are truncated to the most recent ${t.seqLen}; shorter ones are left-padded.`);
   }
   if (b.preprocessing) {
@@ -260,7 +269,7 @@ export interface ModelInfo {
   classNames: string[] | null;
   targetNames: string[] | null;
   outputsAreProbabilities: boolean;
-  tokenizer: { level: "char" | "word"; vocabSize: number; seqLen: number; padToken: string; eos: string | null } | null;
+  tokenizer: { level: "char" | "word" | "bpe"; vocabSize: number; seqLen: number; padToken: string; merges?: number; eos: string | null } | null;
   preprocessing: { kind: "tabular"; columns: string[]; normalize: string; missing: string } | null;
   image: { height: number; width: number; channels: number; layout: "HWC"; range: [number, number]; description: string } | null;
   sampling: { temperature: number; topK: number };

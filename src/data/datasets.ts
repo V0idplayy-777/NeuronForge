@@ -12,6 +12,20 @@ import {
   UNK_TOKEN,
   type CorpusStats,
 } from "./corpusLarge";
+import { buildBpeTokenizer, encodeBpeWith, type BpeTokenizer, type MergeRule } from "./bpe";
+
+/** Vocabulary targets for the built-in subword (BPE) language datasets. */
+export const BPE_VOCAB_TARGET = 320;
+export const BPE2_VOCAB_TARGET = 512;
+export const BPE_VOCAB_MIN = 64;
+export const BPE_VOCAB_MAX = 2048;
+
+/** Vocabulary target requested by the user, clamped to something trainable. */
+function bpeCap(requested: unknown, fallback: number): number {
+  const n = Math.round(Number(requested));
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(BPE_VOCAB_MIN, Math.min(BPE_VOCAB_MAX, n));
+}
 
 export interface ColumnInfo {
   name: string;
@@ -73,15 +87,20 @@ export interface ImageSpec {
 }
 
 export interface TokenizerSpec {
-  /** "char" = one token per character, "word" = one token per word. */
-  level: "char" | "word";
-  /** id -> token string. Index 0 is the unknown token for word level. */
+  /** "char" = one token per character, "word" = one token per word, "bpe" = learned subword merges. */
+  level: "char" | "word" | "bpe";
+  /** id -> token string. Index 0 is the unknown token for word and BPE level. */
   tokens: string[];
   seqLen: number;
   /** Token used to left-pad a prompt shorter than seqLen. */
   padToken: string;
   /** Share of corpus tokens outside the vocabulary cap (word level only). */
   oovRate?: number;
+  /**
+   * BPE merge rules, in the order they were learned. Required for BPE level:
+   * the runtime re-applies them to tokenise, exactly as this app does.
+   */
+  merges?: MergeRule[];
 }
 
 export interface SplitSet {
@@ -119,7 +138,9 @@ export type BuiltinId =
   | "patterns"
   | "wave_seq"
   | "tiny_text"
-  | "tiny_text_2";
+  | "tiny_text_2"
+  | "tiny_text_bpe"
+  | "tiny_text_2_bpe";
 
 /** Context window length for the sequence-forecasting dataset. */
 export const SEQ_WINDOW = 12;
@@ -132,6 +153,8 @@ export interface SynthParams {
   trainFrac: number;
   valFrac: number;
   testFrac: number;
+  /** Vocabulary target for the BPE language datasets (64–2048). */
+  bpeVocab?: number;
 }
 
 export const DEFAULT_SYNTH: SynthParams = {
@@ -161,6 +184,8 @@ export const BUILTIN_INFO: Record<BuiltinId, { name: string; description: string
   wave_seq: { name: "Wave sequence forecasting", description: `Each example is a window of ${SEQ_WINDOW} consecutive points from a noisy two-frequency wave; the target is the value that comes right after. For RNN or sequence models — not a language dataset.`, task: "regression", loss: "mse", shape: [SEQ_WINDOW, 1], out: 1 },
   tiny_text: { name: "Tiny character LM", description: `Next-character prediction over ${LM_SEQ_LEN} characters of context on a built-in corpus of greetings, conversations, facts, and advice. Character-level tokens.`, task: "language", loss: "sparse_cce", shape: [LM_SEQ_LEN], out: 1 },
   tiny_text_2: { name: "Tiny character LM 2", description: `The massive word-level corpus: ${LM2_SEQ_LEN} words of context, a frequency-capped vocabulary, and a generated text corpus of greetings, dialogue, narrative, science, computing, history, food, music, sport, health and nature.`, task: "language", loss: "sparse_cce", shape: [LM2_SEQ_LEN], out: 1 },
+  tiny_text_bpe: { name: "Tiny BPE LM", description: `Subword (BPE) next-token prediction over the built-in corpus: ${LM_SEQ_LEN} tokens of context from a ~${BPE_VOCAB_TARGET}-token vocabulary learned by merging the most frequent character pairs. Common words collapse to one or two tokens, so each context window carries far more text than the character-level dataset — and there is no <unk> for words, only for unseen characters.`, task: "language", loss: "sparse_cce", shape: [LM_SEQ_LEN], out: 1 },
+  tiny_text_2_bpe: { name: "Tiny BPE LM 2", description: `Subword (BPE) language modelling on the massive generated corpus: ${LM2_SEQ_LEN} tokens of context, a ~${BPE2_VOCAB_TARGET}-token learned vocabulary, closed by construction — every word in the corpus can be spelled from the learned pieces. The realistic middle ground between the character and whole-word datasets.`, task: "language", loss: "sparse_cce", shape: [LM2_SEQ_LEN], out: 1 },
 };
 
 export function generateBuiltin(id: BuiltinId, params: SynthParams = DEFAULT_SYNTH): PreparedDataset {
@@ -333,6 +358,67 @@ export function generateBuiltin(id: BuiltinId, params: SynthParams = DEFAULT_SYN
       lmTokenizer = { level: "char", tokens: chars.slice(), seqLen: seq, padToken: " " };
       break;
     }
+    case "tiny_text_bpe": {
+      const seq = LM_SEQ_LEN;
+      inputShape = [seq];
+      const tok: BpeTokenizer = buildBpeTokenizer(TEXT_CORPUS, bpeCap(params.bpeVocab, BPE_VOCAB_TARGET), seq);
+      const ids = encodeBpeWith(tok, TEXT_CORPUS);
+      // Stride 1: BPE tokens are far fewer than characters, so windows overlap
+      // less text per example while still covering the whole corpus.
+      for (let i = 0; i + seq < ids.length; i++) {
+        xs.push(ids.slice(i, i + seq));
+        ys.push([ids[i + seq]!]);
+      }
+      featureNames = Array.from({ length: seq }, (_, i) => `t-${seq - i}`);
+      targetNames = ["next_token"];
+      classNames = tok.tokens.slice();
+      outputUnits = tok.vocabSize;
+      lmTokenizer = {
+        level: "bpe",
+        tokens: tok.tokens.slice(),
+        merges: tok.merges.map(([a, b]) => [a, b] as MergeRule),
+        seqLen: seq,
+        padToken: " ",
+        oovRate: 0,
+      };
+      corpusStats = {
+        chars: tok.corpusChars,
+        lines: TEXT_CORPUS.split("\n").length,
+        templateLines: 0,
+        handwrittenLines: TEXT_CORPUS.split("\n").length,
+        tokens: tok.totalTokens,
+        uniqueTokens: tok.uniqueTokens,
+        topTokens: [],
+      };
+      break;
+    }
+    case "tiny_text_2_bpe": {
+      const seq = LM2_SEQ_LEN;
+      inputShape = [seq];
+      const { text, stats } = buildMassiveCorpus(params.seed + 4242);
+      corpusStats = stats;
+      const tok = buildBpeTokenizer(text, bpeCap(params.bpeVocab, BPE2_VOCAB_TARGET), seq);
+      const ids = encodeBpeWith(tok, text);
+      const span = Math.max(1, ids.length - seq);
+      const stride = Math.max(1, Math.ceil(span / LM2_MAX_WINDOWS));
+      for (let i = 0; i + seq < ids.length; i += stride) {
+        xs.push(ids.slice(i, i + seq));
+        ys.push([ids[i + seq]!]);
+      }
+      featureNames = Array.from({ length: seq }, (_, i) => `t-${seq - i}`);
+      targetNames = ["next_token"];
+      classNames = tok.tokens.slice();
+      outputUnits = tok.vocabSize;
+      lmTokenizer = {
+        level: "bpe",
+        tokens: tok.tokens.slice(),
+        merges: tok.merges.map(([a, b]) => [a, b] as MergeRule),
+        seqLen: seq,
+        padToken: " ",
+        oovRate: 0,
+      };
+      break;
+    }
     case "tiny_text_2": {
       const seq = LM2_SEQ_LEN;
       inputShape = [seq];
@@ -396,6 +482,10 @@ function attributionFor(
 ): string {
   if (id === "tiny_text") {
     return `Built-in character corpus (${TEXT_CORPUS.length} chars, ${TEXT_CHARS.length} unique tokens, ${LM_SEQ_LEN}-char context). Tokenizer mapping is saved with exported models.`;
+  }
+  if ((id === "tiny_text_bpe" || id === "tiny_text_2_bpe") && tok && tok.level === "bpe") {
+    const merges = tok.merges?.length ?? 0;
+    return `Built-in corpus tokenised with BPE (${merges} learned merges, ${tok.tokens.length.toLocaleString()} tokens, ${tok.seqLen}-token context). The merge rules are saved with exported models, so the exported runtime tokenises exactly as this app does.`;
   }
   if (id === "tiny_text_2" && stats && tok) {
     return (

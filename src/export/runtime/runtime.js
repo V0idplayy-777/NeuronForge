@@ -13,12 +13,12 @@
  * floating-point noise (and are usually bit-identical in the same JS engine).
  */
 
-var NF_RUNTIME_VERSION = "1.1.0";
+var NF_RUNTIME_VERSION = "1.3.0";
 var NF_BUNDLE_FORMAT = "neuronforge-standalone";
 var NF_BUNDLE_VERSION = 1;
 var NF_SUPPORTED_LAYERS = [
   "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-  "gap2d", "embedding", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+  "gap2d", "embedding", "attention", "transformer_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
   "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 ];
 var NF_ACTIVATION_LAYERS = ["relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
@@ -216,6 +216,12 @@ function nfInferShape(type, c, s, name) {
       var u = nfNum(c.units, 32);
       return nfBool(c.returnSequences, false) ? [s[0], u] : [u];
     }
+    case "attention":
+    case "transformer_block": {
+      if (s.length !== 2) fail("expects a sequence [seqLen, features], got " + nfShapeStr(s));
+      var ap = nfAttentionPlan(c, s, name);
+      return nfAttentionOut(ap, s[0]);
+    }
     case "residual_dense": {
       if (s.length !== 1) fail("expects rank-1 input, got " + nfShapeStr(s));
       return [nfResidualWidth(c, s[0])];
@@ -301,6 +307,46 @@ function nfExpectedParams(type, c, s, out) {
         Whz: [gh, gh], Whr: [gh, gh], Whn: [gh, gh],
         bz: [gh], br: [gh], bn: [gh],
       };
+    }
+    case "attention": {
+      var ap2 = nfAttentionPlan(c, s, "attention");
+      var aM = ap2.M;
+      var aq = { Wq: [aM, aM], Wk: [aM, aM], Wv: [aM, aM], Wo: [aM, aM] };
+      if (ap2.useBias) {
+        aq.bq = [aM];
+        aq.bk = [aM];
+        aq.bv = [aM];
+        aq.bo = [aM];
+      }
+      if (s[1] !== aM) {
+        aq.Win = [s[1], aM];
+        aq.bin_b = [aM];
+      }
+      return aq;
+    }
+    case "transformer_block": {
+      var bp = nfAttentionPlan(c, s, "transformer_block");
+      var bM = bp.M;
+      var bF = Math.round(nfNum(c.ffDim, 0));
+      if (bF <= 0) bF = 4 * bM;
+      var bq = {
+        Wq: [bM, bM], Wk: [bM, bM], Wv: [bM, bM], Wo: [bM, bM],
+        ln1_gamma: [bM], ln1_beta: [bM], ln2_gamma: [bM], ln2_beta: [bM],
+        W1: [bM, bF], W2: [bF, bM],
+      };
+      if (bp.useBias) {
+        bq.bq = [bM];
+        bq.bk = [bM];
+        bq.bv = [bM];
+        bq.bo = [bM];
+        bq.b1 = [bF];
+        bq.b2 = [bM];
+      }
+      if (s[1] !== bM) {
+        bq.Win = [s[1], bM];
+        bq.bin_b = [bM];
+      }
+      return bq;
     }
     case "residual_dense": {
       var rd = { W1: [s[0], nfResidualWidth(c, s[0])], W2: [nfResidualWidth(c, s[0]), nfResidualWidth(c, s[0])] };
@@ -419,6 +465,155 @@ function nfActivation(name, x, inner, alpha) {
     default:
       throw new Error("Unsupported activation '" + name + "'");
   }
+}
+
+/* ------------------------------------------- attention / transformer helpers */
+
+/** Normalised attention config for a declared input shape, with validation. */
+function nfAttentionPlan(c, s, name) {
+  if (s.length !== 2) {
+    throw new Error("Layer '" + name + "': attention expects a sequence [seqLen, features], got " + nfShapeStr(s));
+  }
+  var rawM = Math.round(nfNum(c.dModel, 0));
+  var M = rawM > 0 ? rawM : s[1];
+  var heads = Math.max(1, Math.round(nfNum(c.heads, 4)));
+  if (M <= 0 || M % heads !== 0) {
+    throw new Error("Layer '" + name + "': dModel " + M + " is not divisible by " + heads + " heads");
+  }
+  var pool = c.pool === "last" || c.pool === "mean" ? String(c.pool) : "none";
+  return {
+    M: M,
+    heads: heads,
+    dh: M / heads,
+    causal: nfBool(c.causal, true),
+    useBias: nfBool(c.useBias, true),
+    invScale: nfNum(c.scale, 1) / Math.sqrt(M / heads),
+    pool: pool,
+  };
+}
+
+function nfAttentionOut(plan, T) {
+  return plan.pool === "none" ? [T, plan.M] : [plan.M];
+}
+
+/** Row-wise softmax in place over `cols`-wide rows starting at `offset`. */
+function nfSoftmaxRows(S, offset, rows, cols) {
+  for (var r = 0; r < rows; r++) {
+    var off = offset + r * cols;
+    var max = -Infinity;
+    for (var i = 0; i < cols; i++) if (S[off + i] > max) max = S[off + i];
+    if (!isFinite(max)) {
+      var u = 1 / cols;
+      for (var z = 0; z < cols; z++) S[off + z] = u;
+      continue;
+    }
+    var sum = 0;
+    for (var j = 0; j < cols; j++) {
+      var e = Math.exp(S[off + j] - max);
+      S[off + j] = e;
+      sum += e;
+    }
+    var inv = 1 / (sum || 1e-12);
+    for (var k = 0; k < cols; k++) S[off + k] *= inv;
+  }
+}
+
+/** LayerNorm over rows of a [rows, cols] matrix (no learnable params: caller passes them). */
+function nfLayerNormRows(X, rows, cols, gamma, beta, eps) {
+  var out = new Float32Array(X.length);
+  for (var r = 0; r < rows; r++) {
+    var off = r * cols;
+    var m = 0;
+    for (var i = 0; i < cols; i++) m += X[off + i];
+    m /= cols;
+    var v = 0;
+    for (var i2 = 0; i2 < cols; i2++) {
+      var d = X[off + i2] - m;
+      v += d * d;
+    }
+    v /= cols;
+    var inv = 1 / Math.sqrt(v + eps);
+    for (var i3 = 0; i3 < cols; i3++) {
+      out[off + i3] = gamma[i3] * ((X[off + i3] - m) * inv) + beta[i3];
+    }
+  }
+  return out;
+}
+
+/** Multi-head self-attention over a [B·T, M] input. Mirrors the engine loop for loop. */
+function nfMhaForward(xin, B, T, plan, P) {
+  var M = plan.M;
+  var H = plan.heads;
+  var dh = plan.dh;
+  var causal = plan.causal;
+  var scale = plan.invScale;
+  var rows = B * T;
+  var Q = nfMatmul(xin, rows, M, P.Wq, M);
+  var K = nfMatmul(xin, rows, M, P.Wk, M);
+  var V = nfMatmul(xin, rows, M, P.Wv, M);
+  if (P.bq) Q = nfAddBias(Q, rows, M, P.bq);
+  if (P.bk) K = nfAddBias(K, rows, M, P.bk);
+  if (P.bv) V = nfAddBias(V, rows, M, P.bv);
+  var O = new Float32Array(rows * M);
+  var S = new Float32Array(T * T);
+  for (var b = 0; b < B; b++) {
+    for (var h = 0; h < H; h++) {
+      for (var z = 0; z < T * T; z++) S[z] = -Infinity;
+      for (var i = 0; i < T; i++) {
+        var qOff = (b * T + i) * M + h * dh;
+        var sOff = i * T;
+        for (var j = 0; j < T; j++) {
+          if (causal && j > i) continue;
+          var kOff = (b * T + j) * M + h * dh;
+          var acc = 0;
+          for (var k = 0; k < dh; k++) acc += Q[qOff + k] * K[kOff + k];
+          S[sOff + j] = acc;
+        }
+      }
+      if (scale !== 1) {
+        for (var i2 = 0; i2 < T; i2++) {
+          var s2 = i2 * T;
+          for (var j2 = 0; j2 < T; j2++) {
+            if (causal && j2 > i2) continue;
+            S[s2 + j2] *= scale;
+          }
+        }
+      }
+      nfSoftmaxRows(S, 0, T, T);
+      for (var i3 = 0; i3 < T; i3++) {
+        var aOff = i3 * T;
+        var oOff = (b * T + i3) * M + h * dh;
+        for (var k2 = 0; k2 < dh; k2++) {
+          var acc2 = 0;
+          for (var j3 = 0; j3 < T; j3++) acc2 += S[aOff + j3] * V[(b * T + j3) * M + h * dh + k2];
+          O[oOff + k2] = acc2;
+        }
+      }
+    }
+  }
+  var Y = nfMatmul(O, rows, M, P.Wo, M);
+  if (P.bo) Y = nfAddBias(Y, rows, M, P.bo);
+  return Y;
+}
+
+/** Reduce a [B, T, M] block output to the layer's declared output. */
+function nfPoolAttention(Y, B, T, M, pool) {
+  if (pool === "none") return Y;
+  var out = new Float32Array(B * M);
+  if (pool === "last") {
+    for (var b = 0; b < B; b++) {
+      var off = (b * T + T - 1) * M;
+      for (var j = 0; j < M; j++) out[b * M + j] = Y[off + j];
+    }
+    return out;
+  }
+  for (var b2 = 0; b2 < B; b2++) {
+    for (var t = 0; t < T; t++) {
+      var off2 = (b2 * T + t) * M;
+      for (var j2 = 0; j2 < M; j2++) out[b2 * M + j2] += Y[off2 + j2] / T;
+    }
+  }
+  return out;
 }
 
 function nfConv2d(xd, kd, bd, B, H, W, Cin, outH, outW, F, kH, kW, stride, padTop, padLeft) {
@@ -603,6 +798,55 @@ function nfCompile(def, s, out, P) {
         }
         return { shape: [B, C], data: o };
       };
+    case "attention": {
+      var ap = nfAttentionPlan(c, s, name);
+      var aD = s[1];
+      var aM = ap.M;
+      var aProj = aD !== aM;
+      return function (x) {
+        if (x.shape.length !== 3) throw new Error("Attention '" + name + "': expected [B, T, " + aD + "], got " + nfShapeStr(x.shape));
+        var B = x.shape[0];
+        var T = x.shape[1];
+        var rows = B * T;
+        var xin = x.data;
+        if (aProj) xin = nfAddBias(nfMatmul(x.data, rows, aD, P.Win, aM), rows, aM, P.bin_b);
+        var Y = nfMhaForward(xin, B, T, ap, P);
+        var pooled = ap.pool === "none" ? Y : nfPoolAttention(Y, B, T, aM, ap.pool);
+        return { shape: [B].concat(nfAttentionOut(ap, T)), data: pooled };
+      };
+    }
+    case "transformer_block": {
+      var bp = nfAttentionPlan(c, s, name);
+      var bD = s[1];
+      var bM = bp.M;
+      var bProj = bD !== bM;
+      var bF = Math.round(nfNum(c.ffDim, 0));
+      if (bF <= 0) bF = 4 * bM;
+      var bEps = nfNum(c.epsilon, 1e-5);
+      var bAct = nfAct(c);
+      return function (x) {
+        if (x.shape.length !== 3) throw new Error("Transformer block '" + name + "': expected [B, T, " + bD + "], got " + nfShapeStr(x.shape));
+        var B = x.shape[0];
+        var T = x.shape[1];
+        var rows = B * T;
+        var xin = x.data;
+        if (bProj) xin = nfAddBias(nfMatmul(x.data, rows, bD, P.Win, bM), rows, bM, P.bin_b);
+        var ln1 = nfLayerNormRows(xin, rows, bM, P.ln1_gamma, P.ln1_beta, bEps);
+        var attn = nfMhaForward(ln1, B, T, bp, P);
+        var h = new Float32Array(rows * bM);
+        for (var i = 0; i < h.length; i++) h[i] = xin[i] + attn[i];
+        var ln2 = nfLayerNormRows(h, rows, bM, P.ln2_gamma, P.ln2_beta, bEps);
+        var hidden = nfMatmul(ln2, rows, bM, P.W1, bF);
+        if (P.b1) hidden = nfAddBias(hidden, rows, bF, P.b1);
+        if (bAct !== "none" && bAct !== "linear") hidden = nfActivation(bAct, hidden, bF, 0.01);
+        var ff = nfMatmul(hidden, rows, bF, P.W2, bM);
+        if (P.b2) ff = nfAddBias(ff, rows, bM, P.b2);
+        var Y = new Float32Array(rows * bM);
+        for (var j = 0; j < Y.length; j++) Y[j] = h[j] + ff[j];
+        var pooled = bp.pool === "none" ? Y : nfPoolAttention(Y, B, T, bM, bp.pool);
+        return { shape: [B].concat(nfAttentionOut(bp, T)), data: pooled };
+      };
+    }
     case "embedding": {
       var vocab = nfNum(c.vocabSize, 32);
       var dim = out[1];
@@ -796,6 +1040,73 @@ function nfCompile(def, s, out, P) {
 
 var NF_WORD_RE = /[a-z0-9]+|[^\sa-z0-9]/g;
 
+/* ----------------------------------------------------------- BPE tokeniser */
+
+/**
+ * Rank lookup for a bundle's BPE merge rules: "left\u0000right" -> rank.
+ * Returns null when the bundle carries no merges (a plain character tokenizer).
+ */
+function nfBuildMergeRanks(tok) {
+  if (!tok || tok.level !== "bpe" || !Array.isArray(tok.merges) || tok.merges.length === 0) return null;
+  var ranks = new Map();
+  for (var i = 0; i < tok.merges.length; i++) {
+    var rule = tok.merges[i];
+    if (!Array.isArray(rule) || rule.length < 2) continue;
+    ranks.set(String(rule[0]) + "\u0000" + String(rule[1]), i);
+  }
+  return ranks;
+}
+
+/** Split text into whitespace runs and mergeable non-whitespace runs. */
+function nfBpeChunks(text) {
+  var out = [];
+  var i = 0;
+  while (i < text.length) {
+    var space = /\s/.test(text[i]);
+    var j = i;
+    while (j < text.length && /\s/.test(text[j]) === space) j++;
+    out.push({ chunk: text.slice(i, j), mergeable: !space });
+    i = j;
+  }
+  return out;
+}
+
+/** Apply the merge rules to one chunk (lowest rank first, like the engine). */
+function nfBpeEncodeChunk(chunk, ranks) {
+  var symbols = chunk.split("");
+  while (symbols.length > 1) {
+    var bestRank = Infinity;
+    var bestAt = -1;
+    for (var i = 0; i + 1 < symbols.length; i++) {
+      var rank = ranks.get(symbols[i] + "\u0000" + symbols[i + 1]);
+      if (rank !== undefined && rank < bestRank) {
+        bestRank = rank;
+        bestAt = i;
+      }
+    }
+    if (bestAt < 0) break;
+    var merged = symbols[bestAt] + symbols[bestAt + 1];
+    symbols.splice(bestAt, 2, merged);
+  }
+  return symbols;
+}
+
+/** BPE encode: whitespace stays as single characters, unseen symbols -> id 0. */
+function nfBpeEncode(text, ranks, stoi) {
+  var lower = String(text).toLowerCase();
+  var chunks = nfBpeChunks(lower);
+  var ids = [];
+  for (var c = 0; c < chunks.length; c++) {
+    var info = chunks[c];
+    var symbols = info.mergeable ? nfBpeEncodeChunk(info.chunk, ranks) : info.chunk.split("");
+    for (var k = 0; k < symbols.length; k++) {
+      var id = stoi.get(symbols[k]);
+      ids.push(id === undefined ? 0 : id);
+    }
+  }
+  return ids;
+}
+
 function nfTokenizeWords(text) {
   var m = String(text).toLowerCase().match(NF_WORD_RE);
   return m ? m.slice() : [];
@@ -987,12 +1298,14 @@ function createModel(bundle, options) {
   var sampling = bundle.sampling || { temperature: 0.7, topK: 50 };
   var stoi = null;
   var padId = 0;
+  var bpeRanks = null;
   if (tok) {
     stoi = new Map();
     tok.tokens.forEach(function (t, i) {
       stoi.set(t, i);
     });
     padId = stoi.has(tok.padToken) ? stoi.get(tok.padToken) : 0;
+    bpeRanks = nfBuildMergeRanks(tok);
     if (task === "language" && tok.tokens.length !== nfNumel(outputShape)) {
       throw new Error("Tokenizer has " + tok.tokens.length + " tokens but the model outputs " + nfNumel(outputShape) + " classes");
     }
@@ -1066,6 +1379,7 @@ function createModel(bundle, options) {
         return stoi.has(w) ? stoi.get(w) : 0;
       });
     }
+    if (tok.level === "bpe" && bpeRanks) return nfBpeEncode(text, bpeRanks, stoi);
     var ids = [];
     var chars = String(text).toLowerCase().split("");
     for (var i = 0; i < chars.length; i++) if (stoi.has(chars[i])) ids.push(stoi.get(chars[i]));
@@ -1183,7 +1497,13 @@ function createModel(bundle, options) {
     stopList.forEach(function (s) { stop[s] = true; });
     var promptIds = tokenize(prompt);
     if (promptIds.length === 0) {
-      throw new Error(tok.level === "word" ? "The prompt contains no word tokens" : "None of the prompt's characters are in the vocabulary");
+      throw new Error(
+        tok.level === "word"
+          ? "The prompt contains no word tokens"
+          : tok.level === "bpe"
+            ? "The prompt produced no subword tokens"
+            : "None of the prompt's characters are in the vocabulary",
+      );
     }
     var rng = new NfRng(seed);
     var ctx = promptIds.slice();
@@ -1319,7 +1639,16 @@ function createModel(bundle, options) {
     classNames: output.classNames || null,
     targetNames: output.targetNames || null,
     outputsAreProbabilities: !!output.outputsAreProbabilities,
-    tokenizer: tok ? { level: tok.level, vocabSize: tok.tokens.length, seqLen: tok.seqLen, padToken: tok.padToken, eos: tok.eos || null } : null,
+    tokenizer: tok
+      ? {
+          level: tok.level,
+          vocabSize: tok.tokens.length,
+          seqLen: tok.seqLen,
+          padToken: tok.padToken,
+          merges: Array.isArray(tok.merges) ? tok.merges.length : 0,
+          eos: tok.eos || null,
+        }
+      : null,
     preprocessing: pp ? { kind: pp.kind, columns: pp.columns.map(function (c) { return c.name; }), normalize: pp.normalize, missing: pp.missing } : null,
     image: img,
     sampling: sampling,

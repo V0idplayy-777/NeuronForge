@@ -4,6 +4,7 @@ import { Tensor } from "./tensor";
 import { RNG } from "./rng";
 import { sampleFromProbs } from "./sampling";
 import { tokenizeWords, joinWords } from "../data/corpusLarge";
+import { bpeEncode, bpeDecode } from "../data/bpe";
 
 /**
  * The single reference implementation of tokenisation + autoregressive
@@ -33,8 +34,23 @@ function tokenMap(tok: TokenizerSpec): Map<string, number> {
   return new Map(tok.tokens.map((t, i) => [t, i]));
 }
 
-/** Word level: unknown words -> id 0 (<unk>). Char level: unknown characters are skipped. */
+/**
+ * The reference tokeniser for every level.
+ *
+ * - word: unknown words → id 0 (`<unk>`).
+ * - char: unknown characters are skipped.
+ * - bpe:  the training merge rules are re-applied; the base alphabet is the
+ *         corpus character set, so only genuinely unseen characters → id 0.
+ */
 export function tokenizeForModel(tok: TokenizerSpec, text: string): number[] {
+  if (tok.level === "bpe") {
+    if (!tok.merges || tok.merges.length === 0) {
+      // A BPE tokenizer without merge rules would be a plain character
+      // tokenizer; fall through to the character path rather than throwing.
+    } else {
+      return bpeEncode(text, tok.tokens, tok.merges);
+    }
+  }
   const map = tokenMap(tok);
   if (tok.level === "word") return tokenizeWords(text).map((w) => map.get(w) ?? 0);
   const out: number[] = [];
@@ -46,6 +62,7 @@ export function tokenizeForModel(tok: TokenizerSpec, text: string): number[] {
 }
 
 export function detokenize(tok: TokenizerSpec, ids: number[]): string {
+  if (tok.level === "bpe") return bpeDecode(ids, tok.tokens);
   const parts: string[] = [];
   for (const id of ids) {
     const t = tok.tokens[id];
@@ -67,7 +84,9 @@ export function generateTokens(model: SequentialModel, tok: TokenizerSpec, promp
     throw new Error(
       tok.level === "word"
         ? `“${prompt}” contains no word tokens. Try plain lowercase English words.`
-        : `None of the characters in “${prompt}” exist in the ${tok.tokens.length}-token vocabulary.`,
+        : tok.level === "bpe"
+          ? `“${prompt}” produced no subword tokens. Try plain lowercase text.`
+          : `None of the characters in “${prompt}” exist in the ${tok.tokens.length}-token vocabulary.`,
     );
   }
   const seq = model.arch.inputShape[0] ?? tok.seqLen;

@@ -24,7 +24,9 @@ export function Evaluation() {
   const [topK, setTopK] = useState(50);
   const [genLen, setGenLen] = useState(60);
   const [seed, setSeed] = useState(1);
-  const wordLevel = s.dataset.meta.tokenizer?.level === "word";
+  const tokLevel = s.dataset.meta.tokenizer?.level;
+  const wordLevel = tokLevel === "word";
+  const bpeLevel = tokLevel === "bpe";
   const task = s.dataset.meta.task;
   const twoD = s.architecture.inputShape.length === 1 && s.architecture.inputShape[0] === 2;
 
@@ -92,11 +94,13 @@ export function Evaluation() {
         {s.dataset.meta.task === "language" ? (
           <div className="space-y-2">
             <Field
-              label={`Seed ${wordLevel ? "words" : "text"}`}
+              label={`Seed ${wordLevel ? "words" : bpeLevel ? "subword text" : "text"}`}
               hint={
                 wordLevel
                   ? `Word-level tokenizer: ${s.dataset.meta.tokenizer?.tokens.length.toLocaleString()} tokens, ${s.dataset.meta.tokenizer?.seqLen} words of context. Unknown words become ${s.dataset.meta.tokenizer?.tokens[0]}.`
-                  : `Character-level tokenizer: ${s.dataset.meta.tokenizer?.tokens.length ?? 0} tokens, ${s.dataset.meta.tokenizer?.seqLen} characters of context.`
+                  : bpeLevel
+                    ? `BPE subword tokenizer: ${s.dataset.meta.tokenizer?.tokens.length.toLocaleString()} tokens (${(s.dataset.meta.tokenizer?.merges?.length ?? 0).toLocaleString()} learned merges), ${s.dataset.meta.tokenizer?.seqLen} tokens of context. Text is lowercased and split with the training merge rules; unseen characters become ${s.dataset.meta.tokenizer?.tokens[0]}.`
+                    : `Character-level tokenizer: ${s.dataset.meta.tokenizer?.tokens.length ?? 0} tokens, ${s.dataset.meta.tokenizer?.seqLen} characters of context.`
               }
             >
               <Input value={prompt} onChange={(e) => setPrompt(e.target.value)} />
@@ -116,7 +120,7 @@ export function Evaluation() {
               <Field label="Top-k" hint={SAMPLING_DOCS.topK}>
                 <Input type="number" min={1} value={topK} onChange={(e) => setTopK(Math.max(1, Number(e.target.value) || 1))} />
               </Field>
-              <Field label={wordLevel ? "Words to generate" : "Characters to generate"}>
+              <Field label={wordLevel ? "Words to generate" : bpeLevel ? "Tokens to generate" : "Characters to generate"}>
                 <Input type="number" min={1} max={800} value={genLen} onChange={(e) => setGenLen(Math.max(1, Number(e.target.value) || 1))} />
               </Field>
               <Field label="Sampling seed" hint="Same seed + same prompt reproduces the same text.">

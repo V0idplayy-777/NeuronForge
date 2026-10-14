@@ -22,6 +22,8 @@ export type LayerType =
   | "avgpool2d"
   | "gap2d"
   | "embedding"
+  | "attention"
+  | "transformer_block"
   | "rnn"
   | "lstm"
   | "gru"

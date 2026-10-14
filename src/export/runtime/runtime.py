@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import math
 import os
 import random
@@ -37,12 +38,12 @@ import sys
 
 import numpy as np
 
-RUNTIME_VERSION = "1.1.0"
+RUNTIME_VERSION = "1.3.0"
 BUNDLE_FORMAT = "neuronforge-standalone"
 BUNDLE_VERSION = 1
 SUPPORTED_LAYERS = (
     "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-    "gap2d", "embedding", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+    "gap2d", "embedding", "attention", "transformer_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
     "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 )
 ACTIVATION_LAYERS = ("relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax")
@@ -206,6 +207,16 @@ def _infer_shape(t, c, s, name):
             fail(f"expects [seqLen, features], got {s}")
         u = _int(c.get("units"), 32)
         return [s[0], u] if _bool(c.get("returnSequences"), False) else [u]
+    if t in ("attention", "transformer_block"):
+        if len(s) != 2:
+            fail(f"expects a sequence [seqLen, features], got {s}")
+        plan = _attention_plan(c, s, name)
+        return list(_attention_out(plan, s[0]))
+    if t in ("attention", "transformer_block"):
+        if len(s) != 2:
+            fail(f"expects a sequence [seqLen, features], got {s}")
+        plan = _attention_plan(c, s, name)
+        return list(_attention_out(plan, s[0]))
     if t == "residual_dense":
         if len(s) != 1:
             fail(f"expects rank-1 input, got {s}")
@@ -249,6 +260,72 @@ def _expected_params(t, c, s, out):
             "Whz": [h, h], "Whr": [h, h], "Whn": [h, h],
             "bz": [h], "br": [h], "bn": [h],
         }
+    if t == "attention":
+        plan = _attention_plan(c, s, "attention")
+        m = plan["M"]
+        p = {"Wq": [m, m], "Wk": [m, m], "Wv": [m, m], "Wo": [m, m]}
+        if plan["useBias"]:
+            p["bq"] = [m]
+            p["bk"] = [m]
+            p["bv"] = [m]
+            p["bo"] = [m]
+        if s[1] != m:
+            p["Win"] = [s[1], m]
+            p["bin_b"] = [m]
+        return p
+    if t == "transformer_block":
+        plan = _attention_plan(c, s, "transformer_block")
+        m = plan["M"]
+        ff = _ff_width(c, m)
+        p = {
+            "Wq": [m, m], "Wk": [m, m], "Wv": [m, m], "Wo": [m, m],
+            "ln1_gamma": [m], "ln1_beta": [m], "ln2_gamma": [m], "ln2_beta": [m],
+            "W1": [m, ff], "W2": [ff, m],
+        }
+        if plan["useBias"]:
+            p["bq"] = [m]
+            p["bk"] = [m]
+            p["bv"] = [m]
+            p["bo"] = [m]
+            p["b1"] = [ff]
+            p["b2"] = [m]
+        if s[1] != m:
+            p["Win"] = [s[1], m]
+            p["bin_b"] = [m]
+        return p
+    if t == "attention":
+        plan = _attention_plan(c, s, "attention")
+        m = plan["M"]
+        p = {"Wq": [m, m], "Wk": [m, m], "Wv": [m, m], "Wo": [m, m]}
+        if plan["useBias"]:
+            p["bq"] = [m]
+            p["bk"] = [m]
+            p["bv"] = [m]
+            p["bo"] = [m]
+        if s[1] != m:
+            p["Win"] = [s[1], m]
+            p["bin_b"] = [m]
+        return p
+    if t == "transformer_block":
+        plan = _attention_plan(c, s, "transformer_block")
+        m = plan["M"]
+        ff = _ff_width(c, m)
+        p = {
+            "Wq": [m, m], "Wk": [m, m], "Wv": [m, m], "Wo": [m, m],
+            "ln1_gamma": [m], "ln1_beta": [m], "ln2_gamma": [m], "ln2_beta": [m],
+            "W1": [m, ff], "W2": [ff, m],
+        }
+        if plan["useBias"]:
+            p["bq"] = [m]
+            p["bk"] = [m]
+            p["bv"] = [m]
+            p["bo"] = [m]
+            p["b1"] = [ff]
+            p["b2"] = [m]
+        if s[1] != m:
+            p["Win"] = [s[1], m]
+            p["bin_b"] = [m]
+        return p
     if t == "residual_dense":
         w = _residual_width(c, s[0])
         p = {"W1": [s[0], w], "W2": [w, w]}
@@ -271,6 +348,196 @@ def _expected_params(t, c, s, out):
 
 
 # --------------------------------------------------------------------------- ops
+
+def _attention_plan(c, s, name):
+    """Normalised attention config for a declared input shape, with validation."""
+    if len(s) != 2:
+        raise ValueError(f"Layer '{name}': attention expects a sequence [seqLen, features], got {list(s)}")
+    raw_m = int(round(_num(c.get("dModel"), 0)))
+    m = raw_m if raw_m > 0 else int(s[1])
+    heads = max(1, int(round(_num(c.get("heads"), 4))))
+    if m <= 0 or m % heads != 0:
+        raise ValueError(f"Layer '{name}': dModel {m} is not divisible by {heads} heads")
+    pool = c.get("pool")
+    if pool not in ("last", "mean"):
+        pool = "none"
+    return {
+        "M": m,
+        "heads": heads,
+        "dh": m // heads,
+        "causal": _bool(c.get("causal"), True),
+        "useBias": _bool(c.get("useBias"), True),
+        "invScale": _num(c.get("scale"), 1) / math.sqrt(m / heads),
+        "pool": pool,
+    }
+
+
+def _ff_width(c, m):
+    raw = int(round(_num(c.get("ffDim"), 0)))
+    return raw if raw > 0 else 4 * m
+
+
+def _attention_out(plan, T):
+    return (T, plan["M"]) if plan["pool"] == "none" else (plan["M"],)
+
+
+def _softmax_rows(x):
+    """Row-wise softmax; rows that are entirely -inf become uniform."""
+    m = np.max(x, axis=-1, keepdims=True)
+    finite = np.isfinite(m)
+    safe = np.where(finite, m, 0.0)
+    e = np.exp(np.where(np.isfinite(x), x - safe, -np.inf))
+    total = e.sum(axis=-1, keepdims=True)
+    out = e / np.where(total > 0, total, 1.0)
+    uniform = np.full_like(out, 1.0 / x.shape[-1])
+    return np.where(finite, out, uniform)
+
+
+def _layer_norm_rows(x, gamma, beta, eps):
+    mean = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    return gamma * (x - mean) / np.sqrt(var + eps) + beta
+
+
+def _mha_forward(xin, B, T, plan, P):
+    """Multi-head self-attention over a (B*T, M) input, matching the engine's maths."""
+    M, H, dh = plan["M"], plan["heads"], plan["dh"]
+    scale = plan["invScale"]
+    xt = np.asarray(xin, dtype=F64).reshape(B * T, M)
+    Q = xt @ P["Wq"].astype(F64)
+    K = xt @ P["Wk"].astype(F64)
+    V = xt @ P["Wv"].astype(F64)
+    if P.get("bq") is not None:
+        Q = Q + P["bq"].astype(F64)
+    if P.get("bk") is not None:
+        K = K + P["bk"].astype(F64)
+    if P.get("bv") is not None:
+        V = V + P["bv"].astype(F64)
+    Q = Q.reshape(B, T, M)
+    K = K.reshape(B, T, M)
+    V = V.reshape(B, T, M)
+    O = np.zeros((B, T, M), dtype=F64)
+    upper = np.triu(np.ones((T, T), dtype=bool), 1) if plan["causal"] else None
+    for b in range(B):
+        for h in range(H):
+            sl = slice(h * dh, (h + 1) * dh)
+            qh = Q[b, :, sl]
+            kh = K[b, :, sl]
+            vh = V[b, :, sl]
+            scores = (qh @ kh.T) * scale
+            if upper is not None:
+                scores = np.where(upper, -np.inf, scores)
+            attn = _softmax_rows(scores)
+            O[b, :, sl] = attn @ vh
+    y = O.reshape(B * T, M) @ P["Wo"].astype(F64)
+    if P.get("bo") is not None:
+        y = y + P["bo"].astype(F64)
+    return y
+
+
+def _pool_attention(y, B, T, plan):
+    """(B, T, M) -> the layer's declared output."""
+    if plan["pool"] == "none":
+        return y.reshape(B, T, plan["M"])
+    if plan["pool"] == "last":
+        return y.reshape(B, T, plan["M"])[:, -1, :]
+    return y.reshape(B, T, plan["M"]).mean(axis=1)
+
+
+def _attention_plan(c, s, name):
+    """Normalised attention config for a declared input shape, with validation."""
+    if len(s) != 2:
+        raise ValueError(f"Layer '{name}': attention expects a sequence [seqLen, features], got {list(s)}")
+    raw_m = int(round(_num(c.get("dModel"), 0)))
+    m = raw_m if raw_m > 0 else int(s[1])
+    heads = max(1, int(round(_num(c.get("heads"), 4))))
+    if m <= 0 or m % heads != 0:
+        raise ValueError(f"Layer '{name}': dModel {m} is not divisible by {heads} heads")
+    pool = c.get("pool")
+    if pool not in ("last", "mean"):
+        pool = "none"
+    return {
+        "M": m,
+        "heads": heads,
+        "dh": m // heads,
+        "causal": _bool(c.get("causal"), True),
+        "useBias": _bool(c.get("useBias"), True),
+        "invScale": _num(c.get("scale"), 1) / math.sqrt(m / heads),
+        "pool": pool,
+    }
+
+
+def _ff_width(c, m):
+    raw = int(round(_num(c.get("ffDim"), 0)))
+    return raw if raw > 0 else 4 * m
+
+
+def _attention_out(plan, T):
+    return (T, plan["M"]) if plan["pool"] == "none" else (plan["M"],)
+
+
+def _softmax_rows(x):
+    """Row-wise softmax; rows that are entirely -inf become uniform."""
+    m = np.max(x, axis=-1, keepdims=True)
+    finite = np.isfinite(m)
+    safe = np.where(finite, m, 0.0)
+    e = np.exp(np.where(np.isfinite(x), x - safe, -np.inf))
+    total = e.sum(axis=-1, keepdims=True)
+    out = e / np.where(total > 0, total, 1.0)
+    uniform = np.full_like(out, 1.0 / x.shape[-1])
+    return np.where(finite, out, uniform)
+
+
+def _layer_norm_rows(x, gamma, beta, eps):
+    mean = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    return gamma * (x - mean) / np.sqrt(var + eps) + beta
+
+
+def _mha_forward(xin, B, T, plan, P):
+    """Multi-head self-attention over a (B*T, M) input, matching the engine's maths."""
+    M, H, dh = plan["M"], plan["heads"], plan["dh"]
+    scale = plan["invScale"]
+    xt = np.asarray(xin, dtype=F64).reshape(B * T, M)
+    Q = xt @ P["Wq"].astype(F64)
+    K = xt @ P["Wk"].astype(F64)
+    V = xt @ P["Wv"].astype(F64)
+    if P.get("bq") is not None:
+        Q = Q + P["bq"].astype(F64)
+    if P.get("bk") is not None:
+        K = K + P["bk"].astype(F64)
+    if P.get("bv") is not None:
+        V = V + P["bv"].astype(F64)
+    Q = Q.reshape(B, T, M)
+    K = K.reshape(B, T, M)
+    V = V.reshape(B, T, M)
+    O = np.zeros((B, T, M), dtype=F64)
+    upper = np.triu(np.ones((T, T), dtype=bool), 1) if plan["causal"] else None
+    for b in range(B):
+        for h in range(H):
+            sl = slice(h * dh, (h + 1) * dh)
+            qh = Q[b, :, sl]
+            kh = K[b, :, sl]
+            vh = V[b, :, sl]
+            scores = (qh @ kh.T) * scale
+            if upper is not None:
+                scores = np.where(upper, -np.inf, scores)
+            attn = _softmax_rows(scores)
+            O[b, :, sl] = attn @ vh
+    y = O.reshape(B * T, M) @ P["Wo"].astype(F64)
+    if P.get("bo") is not None:
+        y = y + P["bo"].astype(F64)
+    return y
+
+
+def _pool_attention(y, B, T, plan):
+    """(B, T, M) -> the layer's declared output."""
+    if plan["pool"] == "none":
+        return y.reshape(B, T, plan["M"])
+    if plan["pool"] == "last":
+        return y.reshape(B, T, plan["M"])[:, -1, :]
+    return y.reshape(B, T, plan["M"]).mean(axis=1)
+
 
 def _sigmoid(x):
     xd = x.astype(F64)
@@ -414,6 +681,116 @@ def _compile(d, c, s, out, P):
 
     if t == "gap2d":
         return lambda x: x.astype(F64).mean(axis=(1, 2)).astype(F32)
+
+    if t == "attention":
+        plan = _attention_plan(c, s, name)
+        din = int(s[1])
+        m = plan["M"]
+        proj = din != m
+
+        def f(x):
+            if x.ndim != 3:
+                raise ValueError(f"Attention '{name}': expected [B, T, {din}], got {list(x.shape)}")
+            B, T, _ = x.shape
+            xin = x
+            if proj:
+                xin = (x.astype(F64).reshape(B * T, din) @ P["Win"].astype(F64) + P["bin_b"].astype(F64)).astype(F32)
+            y = _mha_forward(xin, B, T, plan, P)
+            return _pool_attention(y, B, T, plan).astype(F32)
+        return f
+
+    if t == "transformer_block":
+        plan = _attention_plan(c, s, name)
+        din = int(s[1])
+        m = plan["M"]
+        ff = _ff_width(c, m)
+        proj = din != m
+        eps = _num(c.get("epsilon"), 1e-5)
+        act = _act_name(c)
+        g1 = P["ln1_gamma"].astype(F64)
+        b1 = P["ln1_beta"].astype(F64)
+        g2 = P["ln2_gamma"].astype(F64)
+        b2 = P["ln2_beta"].astype(F64)
+
+        def f(x):
+            if x.ndim != 3:
+                raise ValueError(f"Transformer block '{name}': expected [B, T, {din}], got {list(x.shape)}")
+            B, T, _ = x.shape
+            xin = x
+            if proj:
+                xin = (x.astype(F64).reshape(B * T, din) @ P["Win"].astype(F64) + P["bin_b"].astype(F64)).astype(F32)
+            xf = np.asarray(xin, dtype=F64).reshape(B * T, m)
+            ln1 = _layer_norm_rows(xf, g1, b1, eps)
+            attn = _mha_forward(ln1, B, T, plan, P)
+            h = xf + attn
+            ln2 = _layer_norm_rows(h, g2, b2, eps)
+            hidden = ln2 @ P["W1"].astype(F64)
+            if P.get("b1") is not None:
+                hidden = hidden + P["b1"].astype(F64)
+            hidden = hidden.astype(F32)
+            if act != "none":
+                hidden = _activation(act, hidden, 0.01)
+            out = hidden.astype(F64) @ P["W2"].astype(F64)
+            if P.get("b2") is not None:
+                out = out + P["b2"].astype(F64)
+            y = h + out
+            return _pool_attention(y, B, T, plan).astype(F32)
+        return f
+
+    if t == "attention":
+        plan = _attention_plan(c, s, name)
+        din = int(s[1])
+        m = plan["M"]
+        proj = din != m
+
+        def f(x):
+            if x.ndim != 3:
+                raise ValueError(f"Attention '{name}': expected [B, T, {din}], got {list(x.shape)}")
+            B, T, _ = x.shape
+            xin = x
+            if proj:
+                xin = (x.astype(F64).reshape(B * T, din) @ P["Win"].astype(F64) + P["bin_b"].astype(F64)).astype(F32)
+            y = _mha_forward(xin, B, T, plan, P)
+            return _pool_attention(y, B, T, plan).astype(F32)
+        return f
+
+    if t == "transformer_block":
+        plan = _attention_plan(c, s, name)
+        din = int(s[1])
+        m = plan["M"]
+        ff = _ff_width(c, m)
+        proj = din != m
+        eps = _num(c.get("epsilon"), 1e-5)
+        act = _act_name(c)
+        g1 = P["ln1_gamma"].astype(F64)
+        b1 = P["ln1_beta"].astype(F64)
+        g2 = P["ln2_gamma"].astype(F64)
+        b2 = P["ln2_beta"].astype(F64)
+
+        def f(x):
+            if x.ndim != 3:
+                raise ValueError(f"Transformer block '{name}': expected [B, T, {din}], got {list(x.shape)}")
+            B, T, _ = x.shape
+            xin = x
+            if proj:
+                xin = (x.astype(F64).reshape(B * T, din) @ P["Win"].astype(F64) + P["bin_b"].astype(F64)).astype(F32)
+            xf = np.asarray(xin, dtype=F64).reshape(B * T, m)
+            ln1 = _layer_norm_rows(xf, g1, b1, eps)
+            attn = _mha_forward(ln1, B, T, plan, P)
+            h = xf + attn
+            ln2 = _layer_norm_rows(h, g2, b2, eps)
+            hidden = ln2 @ P["W1"].astype(F64)
+            if P.get("b1") is not None:
+                hidden = hidden + P["b1"].astype(F64)
+            hidden = hidden.astype(F32)
+            if act != "none":
+                hidden = _activation(act, hidden, 0.01)
+            out = hidden.astype(F64) @ P["W2"].astype(F64)
+            if P.get("b2") is not None:
+                out = out + P["b2"].astype(F64)
+            y = h + out
+            return _pool_attention(y, B, T, plan).astype(F32)
+        return f
 
     if t == "embedding":
         vocab = _int(c.get("vocabSize"), 32)
@@ -714,6 +1091,8 @@ class StandaloneModel:
         self.sampling = bundle.get("sampling") or {"temperature": 0.7, "topK": 50}
         self._stoi = {}
         self._pad_id = 0
+        self._ranks = None
+        self._ranks_built = False
         if self.tokenizer:
             for i, tkn in enumerate(self.tokenizer["tokens"]):
                 self._stoi[tkn] = i
@@ -782,11 +1161,48 @@ class StandaloneModel:
         return out
 
     # ---- tokenizer ----
+    def _bpe_ranks(self):
+        """Rank lookup for the bundle's merge rules, or None without merges."""
+        if self._ranks_built:
+            return self._ranks
+        self._ranks_built = True
+        tok = self.tokenizer or {}
+        merges = tok.get("merges")
+        if tok.get("level") != "bpe" or not merges:
+            self._ranks = None
+            return None
+        self._ranks = {str(rule[0]) + "\u0000" + str(rule[1]): i for i, rule in enumerate(merges) if len(rule) >= 2}
+        return self._ranks
+
+    def _bpe_encode_chunk(self, chunk, ranks):
+        """Apply the merge rules to one non-whitespace run (lowest rank first)."""
+        symbols = list(chunk)
+        while len(symbols) > 1:
+            best_rank = None
+            best_at = -1
+            for i in range(len(symbols) - 1):
+                rank = ranks.get(symbols[i] + "\u0000" + symbols[i + 1])
+                if rank is not None and (best_rank is None or rank < best_rank):
+                    best_rank = rank
+                    best_at = i
+            if best_at < 0:
+                break
+            symbols[best_at:best_at + 2] = [symbols[best_at] + symbols[best_at + 1]]
+        return symbols
+
     def tokenize(self, text):
         if not self.tokenizer:
             raise ValueError("This model was not exported with a tokenizer")
         if self.tokenizer["level"] == "word":
             return [self._stoi.get(w, 0) for w in tokenize_words(text)]
+        ranks = self._bpe_ranks()
+        if ranks is not None:
+            ids = []
+            for chunk in re.findall(r"\s+|\S+", str(text).lower()):
+                symbols = list(chunk) if chunk[:1].isspace() else self._bpe_encode_chunk(chunk, ranks)
+                for symbol in symbols:
+                    ids.append(self._stoi.get(symbol, 0))
+            return ids
         return [self._stoi[ch] for ch in str(text).lower() if ch in self._stoi]
 
     def detokenize(self, ids):
@@ -862,7 +1278,14 @@ class StandaloneModel:
             stop = [self.tokenizer["eos"]] if stop_at_eos and self.tokenizer.get("eos") else []
         prompt_ids = self.tokenize(prompt)
         if not prompt_ids:
-            raise ValueError("The prompt contains no tokens from the vocabulary")
+            level = self.tokenizer["level"]
+            raise ValueError(
+                "The prompt contains no word tokens"
+                if level == "word"
+                else "The prompt produced no subword tokens"
+                if level == "bpe"
+                else "None of the prompt's characters are in the vocabulary"
+            )
         rng = RNG(seed)
         ctx = list(prompt_ids)
         ids = []
@@ -972,7 +1395,8 @@ class StandaloneModel:
                 "outputShape": self.output_shape, "paramCount": self.param_count, "layers": self.layer_info,
                 "tokenizer": None if not self.tokenizer else {"level": self.tokenizer["level"],
                                                               "vocabSize": len(self.tokenizer["tokens"]),
-                                                              "seqLen": self.tokenizer["seqLen"]},
+                                                              "seqLen": self.tokenizer["seqLen"],
+                                                              "merges": len(self.tokenizer.get("merges") or [])},
                 "limitations": self.bundle.get("limitations", []), "runtimeVersion": RUNTIME_VERSION}
 
 
