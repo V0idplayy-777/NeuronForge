@@ -9,6 +9,9 @@ import { buildCustom, serializePrepared, deserializePrepared, type CustomSpec } 
 import { listProjects, saveProject, deleteProject, snapshotWeights, type StoredProject } from "./persist/db";
 import type { Experiment, ViewId } from "./persist/types";
 import type { OptimizerState } from "./engine/optimizers";
+import { acquireBackend, releaseBackend, hasWebGpu, type BackendPreference, type BackendStatus } from "./engine/gpu/backend";
+import { verifyDevice, summarizeChecks, type DeviceCheck } from "./engine/gpu/verify";
+import { Accelerator } from "./engine/gpu/executor";
 
 export interface LogEntry {
   t: number;
@@ -81,9 +84,29 @@ interface Store {
 
   setOptState: (s: OptimizerState | null) => void;
   loadImportedModel: (m: SequentialModel) => void;
+
+  /** Compute backend (CPU by default, WebGPU opt-in). */
+  backendPreference: BackendPreference;
+  setBackendPreference: (p: BackendPreference) => void;
+  backendStatus: BackendStatus | null;
+  webgpuAvailable: boolean;
+  /** Result of the last device verification (kernels vs the CPU reference). */
+  deviceReport: DeviceCheck[] | null;
+  verifyingDevice: boolean;
+  verifyDeviceNow: () => Promise<void>;
+  /** How the last training run was split between device and CPU layers. */
+  backendPlacements: { device: number; cpu: number } | null;
 }
 
 const Ctx = createContext<Store | null>(null);
+
+/**
+ * Parameters below which "auto" mode keeps training on the CPU. Uploading a
+ * batch, reading the output back and collecting gradients costs several device
+ * round trips per batch; under this size the arithmetic is too small to hide
+ * them and the CPU engine is genuinely faster.
+ */
+export const DEVICE_PARAM_THRESHOLD = 20000;
 
 function starterProject(): StoredProject {
   const preset = PRESETS[0]!;
@@ -143,6 +166,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [undoStack, setUndo] = useState<Architecture[]>([]);
   const [redoStack, setRedo] = useState<Architecture[]>([]);
   const trainerRef = useRef<Trainer | null>(null);
+  const [backendPreference, setBackendPreferenceState] = useState<BackendPreference>(() => {
+    try {
+      const stored = localStorage.getItem("nf.backend");
+      return stored === "webgpu" || stored === "cpu" ? stored : "auto";
+    } catch {
+      return "auto";
+    }
+  });
+  const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null);
+  const [deviceReport, setDeviceReport] = useState<DeviceCheck[] | null>(null);
+  const [verifyingDevice, setVerifyingDevice] = useState(false);
+  const [backendPlacements, setBackendPlacements] = useState<{ device: number; cpu: number } | null>(null);
+  const verifiedRef = useRef<{ preference: BackendPreference; report: DeviceCheck[] } | null>(null);
   const modelRef = useRef(model);
   modelRef.current = model;
   const projectRef = useRef(project);
@@ -591,7 +627,54 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
     }
+    const backend = await acquireBackend(backendPreference);
+    setBackendStatus(backend.status);
+    let accelerator: Accelerator | null = null;
+    // A device round trip costs a stall per batch; on a small model that is
+    // more than the arithmetic saves. "Auto" therefore waits until the model is
+    // big enough to hide the transfer, while an explicit WebGPU preference
+    // always uses the device (the user asked for it).
+    const trainable = m.paramCount().trainable;
+    const worthDevice = backendPreference === "webgpu" || trainable >= DEVICE_PARAM_THRESHOLD;
+    if (backend.status.kind === "webgpu" && !worthDevice) {
+      setBackendPlacements(null);
+      log(
+        "info",
+        `WebGPU is available, but ${trainable.toLocaleString()} trainable parameters is below the ${DEVICE_PARAM_THRESHOLD.toLocaleString()}-parameter point where a per-batch device round trip pays off — training on the CPU. Pick "WebGPU" in Settings to force it anyway.`,
+      );
+    }
+    if (backend.status.kind === "webgpu" && worthDevice) {
+      // Verify the kernels against the CPU engine once per device before use.
+      if (!verifiedRef.current || verifiedRef.current.preference !== backendPreference) {
+        setVerifyingDevice(true);
+        log("info", "Checking the WebGPU device against the CPU engine before the first accelerated epoch…");
+        try {
+          const checks = await verifyDevice(backend.ops);
+          verifiedRef.current = { preference: backendPreference, report: checks };
+          setDeviceReport(checks);
+        } catch (e) {
+          log("warn", `WebGPU verification errored (${e instanceof Error ? e.message : String(e)}); continuing on the CPU.`);
+          verifiedRef.current = null;
+        } finally {
+          setVerifyingDevice(false);
+        }
+      }
+      const report = verifiedRef.current?.report ?? null;
+      const summary = report ? summarizeChecks(report) : null;
+      if (report && summary && summary.failed === 0) {
+        accelerator = new Accelerator(m, backend.ops);
+        setBackendPlacements({ device: accelerator.stats.deviceLayers, cpu: accelerator.stats.cpuLayers });
+        log("info", `WebGPU active · ${accelerator.stats.deviceLayers} layers on the device, ${accelerator.stats.cpuLayers} on the CPU · kernels verified (${summary.passed} checks, worst |diff| ${summary.worst.toExponential(1)}).`);
+      } else if (report) {
+        log("error", `WebGPU kernels failed verification (${summary?.failed ?? "?"} mismatches) — training on the CPU backend.`);
+      }
+    } else {
+      setBackendPlacements(null);
+      if (backend.status.error && backendPreference === "webgpu") log("warn", backend.status.error);
+    }
+
     const t = new Trainer(m, projectRef.current.trainingConfig);
+    t.accelerator = accelerator;
     trainerRef.current = t;
     t.on((p) => setProgress({ ...p, history: p.history.slice() }));
     log("info", `Training started · ${projectRef.current.trainingConfig.epochs} epochs · ${projectRef.current.trainingConfig.optimizer.name} · lr ${projectRef.current.trainingConfig.optimizer.learningRate}`);
@@ -615,7 +698,56 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       setLastActivations(null);
     }
-  }, [log]);
+  }, [log, backendPreference]);
+
+  const setBackendPreference = useCallback((p: BackendPreference) => {
+    setBackendPreferenceState(p);
+    verifiedRef.current = null;
+    setDeviceReport(null);
+    setBackendPlacements(null);
+    if (p === "cpu") {
+      releaseBackend();
+      setBackendStatus(null);
+    }
+    try {
+      localStorage.setItem("nf.backend", p);
+    } catch {
+      /* storage may be unavailable; the preference still applies for this session */
+    }
+  }, []);
+
+  /**
+   * Runs the device's operations against the CPU reference implementation.
+   * Nothing is trusted until this passes: a failing kernel check keeps training
+   * on the CPU rather than producing silently wrong numbers.
+   */
+  const verifyDeviceNow = useCallback(async () => {
+    const pref = backendPreference;
+    const backend = await acquireBackend(pref);
+    setBackendStatus(backend.status);
+    if (backend.status.kind !== "webgpu") {
+      if (backend.status.error) log("warn", backend.status.error);
+      setDeviceReport(null);
+      return;
+    }
+    setVerifyingDevice(true);
+    try {
+      const checks = await verifyDevice(backend.ops);
+      const summary = summarizeChecks(checks);
+      verifiedRef.current = { preference: pref, report: checks };
+      setDeviceReport(checks);
+      if (summary.failed === 0) {
+        log("info", `Device verified: ${summary.passed} kernel checks match the CPU engine (worst |diff| ${summary.worst.toExponential(1)}).`);
+      } else {
+        log("error", `Device verification failed: ${summary.failed} of ${checks.length} checks differ from the CPU engine. Training stays on the CPU.`);
+      }
+    } catch (e) {
+      log("error", `Device verification errored: ${e instanceof Error ? e.message : String(e)}`);
+      setDeviceReport(null);
+    } finally {
+      setVerifyingDevice(false);
+    }
+  }, [backendPreference, log]);
 
   const pauseTraining = useCallback(() => trainerRef.current?.pause(), []);
   const resumeTraining = useCallback(() => trainerRef.current?.resume(), []);
@@ -735,6 +867,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       captureExperiment,
       setOptState,
       loadImportedModel,
+      backendPreference,
+      setBackendPreference,
+      backendStatus,
+      webgpuAvailable: hasWebGpu(),
+      deviceReport,
+      verifyingDevice,
+      verifyDeviceNow,
+      backendPlacements,
     }),
     [
       ready,
@@ -783,6 +923,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       captureExperiment,
       setOptState,
       loadImportedModel,
+      backendPreference,
+      setBackendPreference,
+      backendStatus,
+      deviceReport,
+      verifyingDevice,
+      verifyDeviceNow,
+      backendPlacements,
     ],
   );
 

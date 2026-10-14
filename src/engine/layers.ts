@@ -1,6 +1,6 @@
 import type { ActivationName, InitMethod, LayerDef, LayerType } from "./types";
 import { assert, numel, shapeStr, uid } from "./types";
-import { Tensor, matmul, transpose2d, addBias, sumAxis0, softmaxLast, softmaxBackward } from "./tensor";
+import { Tensor, matmul, transpose2d, addBias, sumAxis0, softmaxLast, softmaxBackward, add } from "./tensor";
 import {
   applyActivation,
   activationBackward,
@@ -57,6 +57,24 @@ export function defaultConfig(type: LayerType): Record<string, unknown> {
       return { targetShape: [1] };
     case "embedding":
       return { vocabSize: 32, embeddingDim: 8 };
+    case "lstm":
+      return { units: 32, returnSequences: false, forgetBias: 1 };
+    case "gru":
+      return { units: 32, returnSequences: false };
+    case "residual_dense":
+      return { units: 0, activation: "relu", useBias: true, projection: "auto", scale: 1, finalActivation: "none" };
+    case "residual_conv":
+      return {
+        filters: 0,
+        kernelSize: 3,
+        stride: 1,
+        padding: "same",
+        activation: "relu",
+        useBias: true,
+        projection: "auto",
+        scale: 1,
+        finalActivation: "none",
+      };
     case "leakyrelu":
       return { alpha: 0.01 };
     default:
@@ -78,6 +96,10 @@ export function layerDisplayName(type: LayerType): string {
     gap2d: "GlobalAvgPool",
     embedding: "Embedding",
     rnn: "RNN",
+    lstm: "LSTM",
+    gru: "GRU",
+    residual_dense: "Residual Dense",
+    residual_conv: "Residual Conv",
     identity: "Identity",
     relu: "ReLU",
     leakyrelu: "Leaky ReLU",
@@ -167,7 +189,81 @@ export function inferOutputShape(type: LayerType, config: Record<string, unknown
       const units = num(config.units, 32);
       return bool(config.returnSequences, false) ? [inputShape[0]!, units] : [units];
     }
+    case "lstm":
+    case "gru": {
+      if (inputShape.length !== 2) {
+        throw new Error(`${type.toUpperCase()} expects a sequence [seqLen, features] (e.g. from an Embedding), got ${shapeStr(inputShape)}`);
+      }
+      const units = num(config.units, 32);
+      if (units <= 0) throw new Error(`${type.toUpperCase()} needs units > 0`);
+      return bool(config.returnSequences, false) ? [inputShape[0]!, units] : [units];
+    }
+    case "residual_dense": {
+      if (inputShape.length !== 1) {
+        throw new Error(`Residual Dense expects rank-1 input, got ${shapeStr(inputShape)}. Add a Flatten layer first.`);
+      }
+      return [residualWidth(config, inputShape[0]!)];
+    }
+    case "residual_conv": {
+      const plan = residualConvPlan(config, inputShape);
+      return [plan.outH, plan.outW, plan.filters];
+    }
   }
+}
+
+/** Output width of a Residual Dense block: `units`, or the input width when units is 0. */
+function residualWidth(config: Record<string, unknown>, din: number): number {
+  const u = Math.round(num(config.units, 0));
+  if (u <= 0) return din;
+  return u;
+}
+
+interface ResidualConvPlan {
+  H: number;
+  W: number;
+  Cin: number;
+  kH: number;
+  kW: number;
+  stride: number;
+  padding: string;
+  filters: number;
+  outH: number;
+  outW: number;
+  /** true when the shortcut is a plain identity (no parameters). */
+  identityShortcut: boolean;
+}
+
+/**
+ * Geometry of a Residual Conv block: two k×k convolutions where only the first
+ * one carries the stride (the classic ResNet basic block), plus a shortcut. The
+ * shortcut is an identity when the block is shape-preserving, otherwise a
+ * 1×1 convolution with the same stride — which produces exactly the same
+ * spatial size as the main path whenever padding is "same".
+ */
+export function residualConvPlan(config: Record<string, unknown>, inputShape: number[]): ResidualConvPlan {
+  if (inputShape.length !== 3) throw new Error(`Residual Conv expects [H, W, C], got ${shapeStr(inputShape)}`);
+  const [H, W, Cin] = inputShape as [number, number, number];
+  const [kH, kW] = kernelWH(config.kernelSize);
+  const stride = Math.max(1, Math.round(num(config.stride, 1)));
+  const padding = String(config.padding ?? "same");
+  const rawF = Math.round(num(config.filters, 0));
+  const filters = rawF > 0 ? rawF : Cin;
+  const g1 = convOut(H, W, kH, kW, stride, padding);
+  const g2 = convOut(g1.outH, g1.outW, kH, kW, 1, padding);
+  if (g2.outH <= 0 || g2.outW <= 0) {
+    throw new Error(`Residual Conv: ${kH}×${kW} kernels do not fit input ${shapeStr(inputShape)} with stride ${stride} / padding ${padding}`);
+  }
+  const identityShortcut = stride === 1 && filters === Cin && g2.outH === H && g2.outW === W;
+  if (!identityShortcut) {
+    const proj = convOut(H, W, 1, 1, stride, "valid");
+    if (proj.outH !== g2.outH || proj.outW !== g2.outW) {
+      throw new Error(
+        `Residual Conv: shortcut of size ${shapeStr([H, W, Cin])} cannot be projected onto the block output ${shapeStr([g2.outH, g2.outW, filters])}. ` +
+          `Use padding "same" (recommended) so the 1×1 projection matches, or keep stride 1 with the same channel count for an identity shortcut.`,
+      );
+    }
+  }
+  return { H, W, Cin, kH, kW, stride, padding, filters, outH: g2.outH, outW: g2.outW, identityShortcut };
 }
 
 export function compileLayer(
@@ -204,6 +300,14 @@ export function compileLayer(
       return compileEmbedding(def, inputShape, outputShape, rng, defaultInit, existing, frozen);
     case "rnn":
       return compileRnn(def, inputShape, outputShape, rng, existing, frozen);
+    case "lstm":
+      return compileLstm(def, inputShape, outputShape, rng, existing, frozen);
+    case "gru":
+      return compileGru(def, inputShape, outputShape, rng, existing, frozen);
+    case "residual_dense":
+      return compileResidualDense(def, inputShape, outputShape, rng, defaultInit, existing, frozen);
+    case "residual_conv":
+      return compileResidualConv(def, inputShape, outputShape, rng, defaultInit, existing, frozen);
     case "identity":
       return compileIdentity(def, inputShape, outputShape, frozen);
     case "relu":
@@ -227,13 +331,13 @@ function bool(v: unknown, d: boolean): boolean {
   return d;
 }
 
-function kernelWH(v: unknown): [number, number] {
+export function kernelWH(v: unknown): [number, number] {
   if (Array.isArray(v) && v.length >= 2) return [Number(v[0]), Number(v[1])];
   const n = num(v, 3);
   return [n, n];
 }
 
-function convOut(H: number, W: number, kH: number, kW: number, stride: number, padding: string): { outH: number; outW: number; padH: number; padW: number } {
+export function convOut(H: number, W: number, kH: number, kW: number, stride: number, padding: string): { outH: number; outW: number; padH: number; padW: number } {
   if (padding === "same") {
     const outH = Math.ceil(H / stride);
     const outW = Math.ceil(W / stride);
@@ -678,7 +782,7 @@ function compileConv2d(
   };
 }
 
-function conv2dForward(
+export function conv2dForward(
   x: Tensor,
   K: Tensor,
   b: Tensor | null,
@@ -724,7 +828,7 @@ function conv2dForward(
   return new Tensor([B, outH, outW, F], out);
 }
 
-function conv2dBackward(
+export function conv2dBackward(
   x: Tensor,
   K: Tensor,
   dy: Tensor,
@@ -1098,6 +1202,623 @@ function compileRnn(
   };
 }
 
+/**
+ * Long short-term memory cell, unrolled over time with full BPTT.
+ *
+ *   i = σ(xWxi + hW hi + bi)      input gate
+ *   f = σ(xWxf + hW hf + bf)      forget gate
+ *   g = tanh(xWxg + hW hg + bg)   candidate
+ *   o = σ(xWxo + hW ho + bo)      output gate
+ *   c' = f ⊙ c + i ⊙ g            cell state
+ *   h' = o ⊙ tanh(c')
+ *
+ * Gate order is i, f, g, o (the same order PyTorch and Keras store them in),
+ * packed as one [D, 4H] input matrix and one [H, 4H] recurrent matrix.
+ * The forget-gate bias defaults to 1, the standard trick for keeping a
+ * gradient path across long sequences.
+ */
+function compileLstm(
+  def: LayerDef,
+  inputShape: number[],
+  outputShape: number[],
+  rng: RNG,
+  existing: { params: Record<string, Tensor> } | undefined,
+  frozen: boolean,
+): CompiledLayer {
+  const D = inputShape[1]!;
+  const H = Math.max(1, Math.round(num(def.config.units, 32)));
+  const G = 4 * H;
+  void outputShape;
+  const returnSeq = bool(def.config.returnSequences, false);
+  const forgetBias = num(def.config.forgetBias, 1);
+  const Wx = maybeReuse(existing, "Wx", [D, G]) ?? initTensor([D, G], "xavier_uniform", rng, D, G);
+  const Wh = maybeReuse(existing, "Wh", [H, G]) ?? initTensor([H, G], "xavier_uniform", rng, H, G);
+  let b = maybeReuse(existing, "b", [G]);
+  if (!b) {
+    b = Tensor.zeros([G]);
+    for (let j = 0; j < H; j++) b.data[H + j] = forgetBias;
+  }
+  const params = { Wx, Wh, b };
+  const grads = emptyGrads(params);
+
+  let lastX: Tensor | null = null;
+  let lastCache: LstmCache | null = null;
+  let lastDims = { B: 0, T: 0 };
+
+  return {
+    def,
+    inputShape,
+    outputShape: returnSeq ? [inputShape[0]!, H] : [H],
+    params,
+    grads,
+    nonTrainable: {},
+    frozen,
+    forward(x: Tensor) {
+      assert(x.rank === 3, `LSTM ${def.name}: expected batched sequence [B, T, ${D}], got ${shapeStr(x.shape)}`);
+      const B = x.shape[0]!;
+      const T = x.shape[1]!;
+      const cache: LstmCache = {
+        pre: new Float32Array(B * (T + 1) * G),
+        h: new Float32Array(B * (T + 1) * H),
+        i: new Float32Array(B * (T + 1) * H),
+        f: new Float32Array(B * (T + 1) * H),
+        g: new Float32Array(B * (T + 1) * H),
+        o: new Float32Array(B * (T + 1) * H),
+        c: new Float32Array(B * (T + 1) * H),
+        ctanh: new Float32Array(B * (T + 1) * H),
+      };
+      const out = returnSeq ? new Float32Array(B * T * H) : new Float32Array(B * H);
+      const xd = x.data;
+      const wx = Wx.data;
+      const wh = Wh.data;
+      const bd = b.data;
+      for (let n = 0; n < B; n++) {
+        for (let t = 0; t < T; t++) {
+          const prev = (n * (T + 1) + t) * H;
+          const cur = prev + H;
+          const pre = (n * (T + 1) + t + 1) * G;
+          const xOff = (n * T + t) * D;
+          for (let j = 0; j < G; j++) {
+            let acc = bd[j]!;
+            for (let i = 0; i < D; i++) acc += xd[xOff + i]! * wx[i * G + j]!;
+            for (let i = 0; i < H; i++) acc += cache.h[prev + i]! * wh[i * G + j]!;
+            cache.pre[pre + j] = acc;
+          }
+          for (let j = 0; j < H; j++) {
+            const pi = cache.pre[pre + j]!;
+            const pf = cache.pre[pre + H + j]!;
+            const pg = cache.pre[pre + 2 * H + j]!;
+            const po = cache.pre[pre + 3 * H + j]!;
+            const ig = sigmoid1(pi);
+            const fg = sigmoid1(pf);
+            const gg = Math.tanh(pg);
+            const og = sigmoid1(po);
+            const c = fg * cache.c[prev + j]! + ig * gg;
+            const th = Math.tanh(c);
+            cache.i[cur + j] = ig;
+            cache.f[cur + j] = fg;
+            cache.g[cur + j] = gg;
+            cache.o[cur + j] = og;
+            cache.c[cur + j] = c;
+            cache.ctanh[cur + j] = th;
+            const h = og * th;
+            cache.h[cur + j] = h;
+            if (returnSeq) out[(n * T + t) * H + j] = h;
+            else if (t === T - 1) out[n * H + j] = h;
+          }
+        }
+      }
+      lastX = x;
+      lastCache = cache;
+      lastDims = { B, T };
+      return returnSeq ? new Tensor([B, T, H], out) : new Tensor([B, H], out);
+    },
+    backward(dy: Tensor) {
+      const x = lastX!;
+      const cache = lastCache!;
+      const { B, T } = lastDims;
+      const dWx = new Float32Array(D * G);
+      const dWh = new Float32Array(H * G);
+      const db = new Float32Array(G);
+      const dx = new Float32Array(x.size);
+      const xd = x.data;
+      const wx = Wx.data;
+      const wh = Wh.data;
+      const dhNext = new Float32Array(H);
+      const dcNext = new Float32Array(H);
+      const dz = new Float32Array(G);
+      for (let n = 0; n < B; n++) {
+        dhNext.fill(0);
+        dcNext.fill(0);
+        for (let t = T - 1; t >= 0; t--) {
+          const prev = (n * (T + 1) + t) * H;
+          const cur = prev + H;
+          const xOff = (n * T + t) * D;
+          for (let j = 0; j < H; j++) {
+            let dh = dhNext[j]!;
+            if (returnSeq) dh += dy.data[(n * T + t) * H + j]!;
+            else if (t === T - 1) dh += dy.data[n * H + j]!;
+            const ig = cache.i[cur + j]!;
+            const fg = cache.f[cur + j]!;
+            const gg = cache.g[cur + j]!;
+            const og = cache.o[cur + j]!;
+            const th = cache.ctanh[cur + j]!;
+            // dL/dc' = dh · o · (1 − tanh²(c')) + dL/dc_{t+1}
+            const dc = dcNext[j]! + dh * og * (1 - th * th);
+            dz[j] = dc * gg * ig * (1 - ig);
+            dz[H + j] = dc * cache.c[prev + j]! * fg * (1 - fg);
+            dz[2 * H + j] = dc * ig * (1 - gg * gg);
+            dz[3 * H + j] = dh * th * og * (1 - og);
+            dcNext[j] = dc * fg;
+          }
+          for (let i = 0; i < D; i++) {
+            const xv = xd[xOff + i]!;
+            let acc = 0;
+            for (let j = 0; j < G; j++) {
+              dWx[i * G + j]! += xv * dz[j]!;
+              acc += wx[i * G + j]! * dz[j]!;
+            }
+            dx[xOff + i] = acc;
+          }
+          for (let j = 0; j < G; j++) db[j]! += dz[j]!;
+          for (let i = 0; i < H; i++) {
+            const hv = cache.h[prev + i]!;
+            let acc = 0;
+            for (let j = 0; j < G; j++) {
+              dWh[i * G + j]! += hv * dz[j]!;
+              acc += wh[i * G + j]! * dz[j]!;
+            }
+            dhNext[i] = acc;
+          }
+        }
+      }
+      grads.Wx = new Tensor([D, G], dWx);
+      grads.Wh = new Tensor([H, G], dWh);
+      grads.b = new Tensor([G], db);
+      return new Tensor(x.shape as number[], dx);
+    },
+    resetCache() {
+      lastX = null;
+      lastCache = null;
+    },
+  };
+}
+
+interface LstmCache {
+  pre: Float32Array;
+  h: Float32Array;
+  i: Float32Array;
+  f: Float32Array;
+  g: Float32Array;
+  o: Float32Array;
+  c: Float32Array;
+  ctanh: Float32Array;
+}
+
+/**
+ * Gated recurrent unit, unrolled over time with full BPTT.
+ *
+ *   z = σ(xWxz + hWhz + bz)                  update gate
+ *   r = σ(xWxr + hWhr + br)                  reset gate
+ *   n = tanh(xWxn + (r ⊙ h)Whn + bn)         candidate
+ *   h' = (1 − z) ⊙ n + z ⊙ h
+ */
+function compileGru(
+  def: LayerDef,
+  inputShape: number[],
+  outputShape: number[],
+  rng: RNG,
+  existing: { params: Record<string, Tensor> } | undefined,
+  frozen: boolean,
+): CompiledLayer {
+  const D = inputShape[1]!;
+  const H = Math.max(1, Math.round(num(def.config.units, 32)));
+  const returnSeq = bool(def.config.returnSequences, false);
+  void outputShape;
+  const mk = (name: string, shape: number[], fanIn: number, fanOut: number): Tensor =>
+    maybeReuse(existing, name, shape) ?? initTensor(shape, "xavier_uniform", rng, fanIn, fanOut);
+  const Wxz = mk("Wxz", [D, H], D, H);
+  const Wxr = mk("Wxr", [D, H], D, H);
+  const Wxn = mk("Wxn", [D, H], D, H);
+  const Whz = mk("Whz", [H, H], H, H);
+  const Whr = mk("Whr", [H, H], H, H);
+  const Whn = mk("Whn", [H, H], H, H);
+  const bz = maybeReuse(existing, "bz", [H]) ?? Tensor.zeros([H]);
+  const br = maybeReuse(existing, "br", [H]) ?? Tensor.zeros([H]);
+  const bn = maybeReuse(existing, "bn", [H]) ?? Tensor.zeros([H]);
+  const params = { Wxz, Wxr, Wxn, Whz, Whr, Whn, bz, br, bn };
+  const grads = emptyGrads(params);
+
+  let lastX: Tensor | null = null;
+  let lastCache: GruCache | null = null;
+  let lastDims = { B: 0, T: 0 };
+
+  return {
+    def,
+    inputShape,
+    outputShape: returnSeq ? [inputShape[0]!, H] : [H],
+    params,
+    grads,
+    nonTrainable: {},
+    frozen,
+    forward(x: Tensor) {
+      assert(x.rank === 3, `GRU ${def.name}: expected batched sequence [B, T, ${D}], got ${shapeStr(x.shape)}`);
+      const B = x.shape[0]!;
+      const T = x.shape[1]!;
+      const cache: GruCache = {
+        h: new Float32Array(B * (T + 1) * H),
+        z: new Float32Array(B * (T + 1) * H),
+        r: new Float32Array(B * (T + 1) * H),
+        n: new Float32Array(B * (T + 1) * H),
+        rn: new Float32Array(B * (T + 1) * H),
+      };
+      const out = returnSeq ? new Float32Array(B * T * H) : new Float32Array(B * H);
+      const xd = x.data;
+      for (let n = 0; n < B; n++) {
+        for (let t = 0; t < T; t++) {
+          const prev = (n * (T + 1) + t) * H;
+          const cur = prev + H;
+          const xOff = (n * T + t) * D;
+          // Pass 1: update and reset gates, and the reset-modulated previous state.
+          for (let j = 0; j < H; j++) {
+            let az = bz.data[j]!;
+            let ar = br.data[j]!;
+            for (let i = 0; i < D; i++) {
+              const xv = xd[xOff + i]!;
+              az += xv * Wxz.data[i * H + j]!;
+              ar += xv * Wxr.data[i * H + j]!;
+            }
+            for (let i = 0; i < H; i++) {
+              const hv = cache.h[prev + i]!;
+              az += hv * Whz.data[i * H + j]!;
+              ar += hv * Whr.data[i * H + j]!;
+            }
+            const zg = sigmoid1(az);
+            const rg = sigmoid1(ar);
+            cache.z[cur + j] = zg;
+            cache.r[cur + j] = rg;
+            cache.rn[cur + j] = rg * cache.h[prev + j]!;
+          }
+          // Pass 2: candidate state and new hidden state (both need all of rn).
+          for (let j = 0; j < H; j++) {
+            let an = bn.data[j]!;
+            for (let i = 0; i < D; i++) an += xd[xOff + i]! * Wxn.data[i * H + j]!;
+            for (let i = 0; i < H; i++) an += cache.rn[cur + i]! * Whn.data[i * H + j]!;
+            const ng = Math.tanh(an);
+            cache.n[cur + j] = ng;
+            const zg = cache.z[cur + j]!;
+            const h = (1 - zg) * ng + zg * cache.h[prev + j]!;
+            cache.h[cur + j] = h;
+            if (returnSeq) out[(n * T + t) * H + j] = h;
+            else if (t === T - 1) out[n * H + j] = h;
+          }
+        }
+      }
+      lastX = x;
+      lastCache = cache;
+      lastDims = { B, T };
+      return returnSeq ? new Tensor([B, T, H], out) : new Tensor([B, H], out);
+    },
+    backward(dy: Tensor) {
+      const x = lastX!;
+      const cache = lastCache!;
+      const { B, T } = lastDims;
+      const dWxz = new Float32Array(D * H);
+      const dWxr = new Float32Array(D * H);
+      const dWxn = new Float32Array(D * H);
+      const dWhz = new Float32Array(H * H);
+      const dWhr = new Float32Array(H * H);
+      const dWhn = new Float32Array(H * H);
+      const dbz = new Float32Array(H);
+      const dbr = new Float32Array(H);
+      const dbn = new Float32Array(H);
+      const dx = new Float32Array(x.size);
+      const xd = x.data;
+      const dhNext = new Float32Array(H);
+      const dzPre = new Float32Array(H);
+      const drPre = new Float32Array(H);
+      const dnPre = new Float32Array(H);
+      const dHprev = new Float32Array(H);
+      const dR = new Float32Array(H);
+      for (let n = 0; n < B; n++) {
+        dhNext.fill(0);
+        for (let t = T - 1; t >= 0; t--) {
+          const prev = (n * (T + 1) + t) * H;
+          const cur = prev + H;
+          const xOff = (n * T + t) * D;
+          for (let j = 0; j < H; j++) {
+            let dh = dhNext[j]!;
+            if (returnSeq) dh += dy.data[(n * T + t) * H + j]!;
+            else if (t === T - 1) dh += dy.data[n * H + j]!;
+            const zg = cache.z[cur + j]!;
+            const ng = cache.n[cur + j]!;
+            dzPre[j] = dh * (cache.h[prev + j]! - ng) * zg * (1 - zg);
+            dnPre[j] = dh * (1 - zg) * (1 - ng * ng);
+            dHprev[j] = dh * zg;
+            dR[j] = 0;
+          }
+          // (r ⊙ h_{t-1}) @ Whn → gradient w.r.t. (r ⊙ h)
+          for (let i = 0; i < H; i++) {
+            let acc = 0;
+            for (let j = 0; j < H; j++) acc += Whn.data[i * H + j]! * dnPre[j]!;
+            const dRn = acc; // d(r ⊙ h_{t-1})[i]
+            dR[i] = dRn * cache.h[prev + i]!;
+            dHprev[i]! += dRn * cache.r[cur + i]!;
+            for (let j = 0; j < H; j++) dWhn[i * H + j]! += cache.rn[cur + i]! * dnPre[j]!;
+          }
+          for (let j = 0; j < H; j++) {
+            const rg = cache.r[cur + j]!;
+            drPre[j] = dR[j]! * rg * (1 - rg);
+          }
+          for (let i = 0; i < D; i++) {
+            const xv = xd[xOff + i]!;
+            let acc = 0;
+            for (let j = 0; j < H; j++) {
+              dWxz[i * H + j]! += xv * dzPre[j]!;
+              dWxr[i * H + j]! += xv * drPre[j]!;
+              dWxn[i * H + j]! += xv * dnPre[j]!;
+              acc += Wxz.data[i * H + j]! * dzPre[j]! + Wxr.data[i * H + j]! * drPre[j]! + Wxn.data[i * H + j]! * dnPre[j]!;
+            }
+            dx[xOff + i] = acc;
+          }
+          for (let i = 0; i < H; i++) {
+            const hv = cache.h[prev + i]!;
+            let acc = 0;
+            for (let j = 0; j < H; j++) {
+              dWhz[i * H + j]! += hv * dzPre[j]!;
+              dWhr[i * H + j]! += hv * drPre[j]!;
+              acc += Whz.data[i * H + j]! * dzPre[j]! + Whr.data[i * H + j]! * drPre[j]!;
+            }
+            dhNext[i] = acc + dHprev[i]!;
+          }
+          for (let j = 0; j < H; j++) {
+            dbz[j]! += dzPre[j]!;
+            dbr[j]! += drPre[j]!;
+            dbn[j]! += dnPre[j]!;
+          }
+        }
+      }
+      grads.Wxz = new Tensor([D, H], dWxz);
+      grads.Wxr = new Tensor([D, H], dWxr);
+      grads.Wxn = new Tensor([D, H], dWxn);
+      grads.Whz = new Tensor([H, H], dWhz);
+      grads.Whr = new Tensor([H, H], dWhr);
+      grads.Whn = new Tensor([H, H], dWhn);
+      grads.bz = new Tensor([H], dbz);
+      grads.br = new Tensor([H], dbr);
+      grads.bn = new Tensor([H], dbn);
+      return new Tensor(x.shape as number[], dx);
+    },
+    resetCache() {
+      lastX = null;
+      lastCache = null;
+    },
+  };
+}
+
+interface GruCache {
+  h: Float32Array;
+  z: Float32Array;
+  r: Float32Array;
+  n: Float32Array;
+  rn: Float32Array;
+}
+
+function sigmoid1(v: number): number {
+  return v >= 0 ? 1 / (1 + Math.exp(-v)) : Math.exp(v) / (1 + Math.exp(v));
+}
+
+/**
+ * Residual Dense block: y = shortcut + scale · (act(x W1 + b1) W2 + b2).
+ * The shortcut is a parameter-free identity whenever in/out widths match
+ * (units = 0, the default); otherwise it is a learned linear projection.
+ */
+function compileResidualDense(
+  def: LayerDef,
+  inputShape: number[],
+  outputShape: number[],
+  rng: RNG,
+  defaultInit: InitMethod,
+  existing: { params: Record<string, Tensor> } | undefined,
+  frozen: boolean,
+): CompiledLayer {
+  const din = inputShape[0]!;
+  const units = residualWidth(def.config, din);
+  const useBias = bool(def.config.useBias, true);
+  const act = String(def.config.activation ?? "relu") as ActivationName;
+  const act2 = String(def.config.finalActivation ?? "none") as ActivationName | "none";
+  const scale = num(def.config.scale, 1);
+  const projMode = String(def.config.projection ?? "auto");
+  const needsProj = units !== din;
+  if (needsProj && projMode === "never") {
+    throw new Error(
+      `Residual Dense ${def.name}: units ${units} ≠ input width ${din}, so the identity shortcut cannot be used. Set projection to "auto" or "always", or set units to ${din}.`,
+    );
+  }
+  const init = (def.config.init as InitMethod) || defaultInit;
+  const W1 = maybeReuse(existing, "W1", [din, units]) ?? initTensor([din, units], init, rng, din, units);
+  const W2 = maybeReuse(existing, "W2", [units, units]) ?? initTensor([units, units], "xavier_uniform", rng, units, units);
+  const b1 = useBias ? (maybeReuse(existing, "b1", [units]) ?? Tensor.zeros([units])) : Tensor.zeros([0]);
+  const b2 = useBias ? (maybeReuse(existing, "b2", [units]) ?? Tensor.zeros([units])) : Tensor.zeros([0]);
+  const Wp = needsProj ? (maybeReuse(existing, "Wp", [din, units]) ?? initTensor([din, units], "xavier_uniform", rng, din, units)) : Tensor.zeros([0]);
+  const params: Record<string, Tensor> = useBias ? { W1, W2, b1, b2 } : { W1, W2 };
+  if (needsProj) params.Wp = Wp;
+  const grads = emptyGrads(params);
+
+  let lastX: Tensor | null = null;
+  let lastActIn: Tensor | null = null;
+  let lastActOut: Tensor | null = null;
+  let lastZ: Tensor | null = null;
+  let lastY: Tensor | null = null;
+
+  return {
+    def,
+    inputShape,
+    outputShape,
+    params,
+    grads,
+    nonTrainable: {},
+    frozen,
+    forward(x: Tensor) {
+      assert(x.rank === 2 && x.shape[1] === din, `Residual Dense ${def.name}: expected [B, ${din}], got ${shapeStr(x.shape)}`);
+      lastX = x;
+      let h = matmul(x, W1);
+      if (useBias) h = addBias(h, b1);
+      const actOut = act === "linear" ? h : applyActivation(act, h);
+      lastActIn = h;
+      lastActOut = actOut;
+      let main = matmul(actOut, W2);
+      if (useBias) main = addBias(main, b2);
+      const shortcut = needsProj ? matmul(x, Wp) : x;
+      const z = add(shortcut, scale === 1 ? main : scaleTensor(main, scale));
+      const y = act2 === "none" ? z : applyActivation(act2, z);
+      lastZ = z;
+      lastY = y;
+      return y;
+    },
+    backward(dy: Tensor) {
+      const gZ = act2 === "none" ? dy : activationBackward(act2, lastZ!, lastY!, dy);
+      const x = lastX!;
+      const actOut = lastActOut!;
+      const gMain = scale === 1 ? gZ : scaleTensor(gZ, scale);
+      grads.W2 = matmul(transpose2d(actOut), gMain);
+      if (useBias) grads.b2 = sumAxis0(gMain);
+      const dAct = matmul(gMain, transpose2d(W2));
+      const dPre = act === "linear" ? dAct : activationBackward(act, lastActIn!, actOut, dAct);
+      grads.W1 = matmul(transpose2d(x), dPre);
+      if (useBias) grads.b1 = sumAxis0(dPre);
+      let dx = matmul(dPre, transpose2d(W1));
+      if (needsProj) {
+        grads.Wp = matmul(transpose2d(x), gZ);
+        dx = add(dx, matmul(gZ, transpose2d(Wp)));
+      } else {
+        dx = add(dx, gZ);
+      }
+      return dx;
+    },
+    resetCache() {
+      lastX = lastActIn = lastActOut = lastZ = lastY = null;
+    },
+  };
+}
+
+function scaleTensor(t: Tensor, s: number): Tensor {
+  const out = new Float32Array(t.size);
+  for (let i = 0; i < t.size; i++) out[i] = t.data[i]! * s;
+  return new Tensor(t.shape as number[], out);
+}
+
+/**
+ * Residual Conv block (the ResNet "basic block"): two k×k convolutions where
+ * only the first carries the stride, plus a shortcut.
+ *   y = shortcut + scale · conv2(act(conv1(x)))
+ */
+function compileResidualConv(
+  def: LayerDef,
+  inputShape: number[],
+  outputShape: number[],
+  rng: RNG,
+  defaultInit: InitMethod,
+  existing: { params: Record<string, Tensor> } | undefined,
+  frozen: boolean,
+): CompiledLayer {
+  const plan = residualConvPlan(def.config, inputShape);
+  const { H, W, Cin, kH, kW, stride, padding, filters, identityShortcut } = plan;
+  const outH = outputShape[0]!;
+  const outW = outputShape[1]!;
+  const useBias = bool(def.config.useBias, true);
+  const act = String(def.config.activation ?? "relu") as ActivationName;
+  const act2 = String(def.config.finalActivation ?? "none") as ActivationName | "none";
+  const scale = num(def.config.scale, 1);
+  const init = (def.config.init as InitMethod) || defaultInit;
+  const fanIn1 = kH * kW * Cin;
+  const fanOut1 = kH * kW * filters;
+  const K1 = maybeReuse(existing, "K1", [kH, kW, Cin, filters]) ?? initTensor([kH, kW, Cin, filters], init, rng, fanIn1, fanOut1);
+  const K2 = maybeReuse(existing, "K2", [kH, kW, filters, filters]) ?? initTensor([kH, kW, filters, filters], init, rng, filters, filters);
+  const b1 = useBias ? (maybeReuse(existing, "b1", [filters]) ?? Tensor.zeros([filters])) : Tensor.zeros([0]);
+  const b2 = useBias ? (maybeReuse(existing, "b2", [filters]) ?? Tensor.zeros([filters])) : Tensor.zeros([0]);
+  const Kp = identityShortcut
+    ? Tensor.zeros([0])
+    : (maybeReuse(existing, "Kp", [1, 1, Cin, filters]) ?? initTensor([1, 1, Cin, filters], "xavier_uniform", rng, Cin, filters));
+  const params: Record<string, Tensor> = useBias ? { K1, K2, b1, b2 } : { K1, K2 };
+  if (!identityShortcut) params.Kp = Kp;
+  const grads = emptyGrads(params);
+
+  // Geometry of each convolution in the block.
+  const g1 = convOut(H, W, kH, kW, stride, padding);
+  const g1PadTop = Math.floor(g1.padH / 2);
+  const g1PadLeft = Math.floor(g1.padW / 2);
+  const g2 = convOut(g1.outH, g1.outW, kH, kW, 1, padding);
+  const g2PadTop = Math.floor(g2.padH / 2);
+  const g2PadLeft = Math.floor(g2.padW / 2);
+  const proj = convOut(H, W, 1, 1, stride, "valid");
+
+  let lastX: Tensor | null = null;
+  let lastConv1: Tensor | null = null;
+  let lastH: Tensor | null = null;
+  let lastZ: Tensor | null = null;
+  let lastY: Tensor | null = null;
+
+  return {
+    def,
+    inputShape,
+    outputShape,
+    params,
+    grads,
+    nonTrainable: {},
+    frozen,
+    forward(x: Tensor) {
+      const B = x.shape[0]!;
+      lastX = x;
+      const c1 = conv2dForward(x, K1, useBias ? b1 : null, B, H, W, Cin, g1.outH, g1.outW, filters, kH, kW, stride, g1PadTop, g1PadLeft);
+      const h = act === "linear" ? c1 : applyActivation(act, c1);
+      lastConv1 = c1;
+      lastH = h;
+      const main = conv2dForward(h, K2, useBias ? b2 : null, B, g1.outH, g1.outW, filters, outH, outW, filters, kH, kW, 1, g2PadTop, g2PadLeft);
+      let shortcut: Tensor;
+      if (identityShortcut) {
+        shortcut = x;
+      } else {
+        shortcut = conv2dForward(x, Kp, null, B, H, W, Cin, proj.outH, proj.outW, filters, 1, 1, stride, 0, 0);
+      }
+      const z = add(shortcut, scale === 1 ? main : scaleTensor(main, scale));
+      const y = act2 === "none" ? z : applyActivation(act2, z);
+      lastZ = z;
+      lastY = y;
+      return y;
+    },
+    backward(dy: Tensor) {
+      const gZ = act2 === "none" ? dy : activationBackward(act2, lastZ!, lastY!, dy);
+      const x = lastX!;
+      const h = lastH!;
+      const B = x.shape[0]!;
+      const gMain = scale === 1 ? gZ : scaleTensor(gZ, scale);
+
+      // Main path: conv2 backward → activation backward → conv1 backward.
+      const d2 = conv2dBackward(h, K2, gMain, B, g1.outH, g1.outW, filters, outH, outW, filters, kH, kW, 1, g2PadTop, g2PadLeft);
+      grads.K2 = d2.dK;
+      if (useBias) grads.b2 = d2.dB;
+      const dAct = act === "linear" ? d2.dX : activationBackward(act, lastConv1!, h, d2.dX);
+      const d1 = conv2dBackward(x, K1, dAct, B, H, W, Cin, g1.outH, g1.outW, filters, kH, kW, stride, g1PadTop, g1PadLeft);
+      grads.K1 = d1.dK;
+      if (useBias) grads.b1 = d1.dB;
+      let dx = d1.dX;
+
+      if (identityShortcut) {
+        dx = add(dx, gZ);
+      } else {
+        const dp = conv2dBackward(x, Kp, gZ, B, H, W, Cin, proj.outH, proj.outW, filters, 1, 1, stride, 0, 0);
+        grads.Kp = dp.dK;
+        dx = add(dx, dp.dX);
+      }
+      return dx;
+    },
+    resetCache() {
+      lastX = lastConv1 = lastH = lastZ = lastY = null;
+    },
+  };
+}
+
 function compileEmbedding(
   def: LayerDef,
   inputShape: number[],
@@ -1262,6 +1983,10 @@ export const LAYER_DOCS: Record<LayerType, string> = {
   gap2d: "Global average pooling: mean over spatial dims, producing one value per channel.",
   embedding: "Maps integer token indices to dense vectors. Used for discrete / language inputs.",
   rnn: "Simple tanh RNN with full backpropagation through time. Processes a sequence step by step and carries a hidden state. Long contexts can suffer vanishing gradients — that is a real property of this architecture, not a bug.",
+  lstm: "Long short-term memory cell with input/forget/output gates and a cell state. Full backpropagation through time. The forget-gate bias starts at 1 so gradients keep a path across long sequences — the reason LSTMs hold context where a plain tanh RNN decays.",
+  gru: "Gated recurrent unit: update and reset gates, no separate cell state. Fewer parameters than an LSTM and a single hidden state; usually the first gate to try on a new sequence task.",
+  residual_dense: "Residual Dense block: y = x + scale·(act(xW1 + b1)W2 + b2). The shortcut is a parameter-free identity when the width is unchanged (units = 0), otherwise a learned linear projection. Stack these to train noticeably deeper feed-forward stacks.",
+  residual_conv: "Residual Conv block (ResNet basic block): two k×k convolutions, only the first carries the stride, plus an identity or 1×1-convolution shortcut. Padding 'same' keeps the shortcut shape-compatible at any stride.",
   identity: "Pass-through. Useful as a placeholder or residual-friendly identity path.",
   relu: "max(0, x)",
   leakyrelu: "x if x>0 else αx",

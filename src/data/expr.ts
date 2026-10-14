@@ -139,7 +139,9 @@ export function compileExpr(src: string): { fn: ExprFn; vars: string[] } {
   function parseUnary(): ExprFn {
     if (peek()?.kind === "op" && (peek()!.value === "-" || peek()!.value === "+")) {
       const op = next()!.value;
-      const inner = parseUnary();
+      // Unary minus binds looser than "^" (so -2^2 is -(2^2) = -4), which means
+      // it has to consume a whole factor rather than a bare primary.
+      const inner = parseFactor();
       return op === "-" ? (v) => -inner(v) : inner;
     }
     return parsePrimary();

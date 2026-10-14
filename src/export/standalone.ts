@@ -13,12 +13,13 @@ export { RUNTIME_JS, RUNTIME_PY };
 
 export const STANDALONE_FORMAT = "neuronforge-standalone";
 export const STANDALONE_VERSION = 1;
-export const STANDALONE_RUNTIME_VERSION = "1.0.0";
+export const STANDALONE_RUNTIME_VERSION = "1.1.0";
 
 /** Every layer type the builder can produce. Anything else is reported as unsupported. */
 export const SUPPORTED_LAYER_TYPES: LayerType[] = [
   "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-  "gap2d", "embedding", "rnn", "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
+  "gap2d", "embedding", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+  "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 ];
 const FUSABLE = ["none", "linear", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
 const ACTIVATION_LAYERS = ["relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
@@ -111,6 +112,10 @@ export function finalActivation(layers: LayerDef[]): string | null {
     if (ACTIVATION_LAYERS.includes(l.type)) return l.type;
     if (l.type === "dense" || l.type === "conv2d") {
       const a = String(l.config.activation ?? "none");
+      return a === "none" || a === "linear" ? null : a;
+    }
+    if (l.type === "residual_dense" || l.type === "residual_conv") {
+      const a = String(l.config.finalActivation ?? "none");
       return a === "none" || a === "linear" ? null : a;
     }
     return null;
@@ -497,6 +502,17 @@ export const COVERAGE_CASES: CoverageCase[] = [
   { name: "Embedding (rounding + clamping)", inputShape: [5], vocab: 7, layers: [{ type: "embedding", config: { vocabSize: 7, embeddingDim: 3 } }, { type: "flatten" }, { type: "dense", config: { units: 2 } }] },
   { name: "Embedding → RNN (final state)", inputShape: [4], vocab: 6, layers: [{ type: "embedding", config: { vocabSize: 6, embeddingDim: 3 } }, { type: "rnn", config: { units: 4 } }] },
   { name: "RNN (return sequences) → Flatten", inputShape: [4, 3], layers: [{ type: "rnn", config: { units: 3, returnSequences: true } }, { type: "flatten" }, { type: "dense", config: { units: 2 } }] },
+  { name: "Embedding → LSTM (final state)", inputShape: [5], vocab: 6, layers: [{ type: "embedding", config: { vocabSize: 6, embeddingDim: 3 } }, { type: "lstm", config: { units: 4 } }] },
+  { name: "LSTM (return sequences) → Flatten → Dense", inputShape: [4, 3], layers: [{ type: "lstm", config: { units: 3, returnSequences: true } }, { type: "flatten" }, { type: "dense", config: { units: 2 } }] },
+  { name: "LSTM (forget bias 0, tanh readout)", inputShape: [3, 2], layers: [{ type: "lstm", config: { units: 2, forgetBias: 0 } }, { type: "tanh" }] },
+  { name: "Embedding → GRU (final state)", inputShape: [5], vocab: 6, layers: [{ type: "embedding", config: { vocabSize: 6, embeddingDim: 3 } }, { type: "gru", config: { units: 4 } }] },
+  { name: "GRU (return sequences) → Flatten → Dense", inputShape: [4, 3], layers: [{ type: "gru", config: { units: 3, returnSequences: true } }, { type: "flatten" }, { type: "dense", config: { units: 2 } }] },
+  { name: "Residual Dense (identity shortcut)", inputShape: [5], layers: [{ type: "residual_dense", config: { units: 0, activation: "relu" } }] },
+  { name: "Residual Dense (projection + final activation)", inputShape: [4], layers: [{ type: "residual_dense", config: { units: 7, activation: "gelu", finalActivation: "tanh", scale: 0.7 } }, { type: "dense", config: { units: 2 } }] },
+  { name: "Stacked residual blocks → softmax", inputShape: [6], layers: [{ type: "residual_dense", config: { units: 0, activation: "silu" } }, { type: "residual_dense", config: { units: 0, activation: "silu" } }, { type: "dense", config: { units: 3 } }, { type: "softmax" }] },
+  { name: "Residual Conv (identity shortcut)", inputShape: [6, 6, 2], layers: [{ type: "residual_conv", config: { filters: 0, kernelSize: 3, stride: 1, padding: "same", activation: "relu" } }] },
+  { name: "Residual Conv (projection, stride 2)", inputShape: [8, 8, 1], layers: [{ type: "residual_conv", config: { filters: 3, kernelSize: 3, stride: 2, padding: "same", activation: "gelu" } }, { type: "gap2d" }, { type: "dense", config: { units: 2 } }] },
+  { name: "Residual Conv (1×1 kernels, valid, no bias)", inputShape: [4, 4, 2], layers: [{ type: "residual_conv", config: { filters: 2, kernelSize: 1, stride: 1, padding: "valid", activation: "linear", finalActivation: "silu", useBias: false } }, { type: "flatten" }, { type: "dense", config: { units: 3 } }] },
 ];
 
 function randomizeParams(m: SequentialModel, rng: RNG): void {

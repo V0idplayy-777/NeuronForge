@@ -37,12 +37,13 @@ import sys
 
 import numpy as np
 
-RUNTIME_VERSION = "1.0.0"
+RUNTIME_VERSION = "1.1.0"
 BUNDLE_FORMAT = "neuronforge-standalone"
 BUNDLE_VERSION = 1
 SUPPORTED_LAYERS = (
     "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-    "gap2d", "embedding", "rnn", "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
+    "gap2d", "embedding", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+    "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 )
 ACTIVATION_LAYERS = ("relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax")
 F32 = np.float32
@@ -126,6 +127,39 @@ def _conv_geom(H, W, kH, kW, stride, padding):
     return (H - kH) // stride + 1, (W - kW) // stride + 1, 0, 0
 
 
+def _residual_width(c, din):
+    u = int(round(_num(c.get("units"), 0)))
+    return u if u > 0 else din
+
+
+def _residual_conv_plan(c, s, name):
+    """Geometry of a Residual Conv block: two k×k convolutions, stride on the first only."""
+    if len(s) != 3:
+        raise ValueError(f"Layer '{name}' (residual_conv): expects [H, W, C], got {s}")
+    H, W, Cin = s
+    kH, kW = _kernel(c.get("kernelSize"))
+    stride = max(1, int(round(_num(c.get("stride"), 1))))
+    padding = _padding(c)
+    raw_f = int(round(_num(c.get("filters"), 0)))
+    filters = raw_f if raw_f > 0 else Cin
+    g1 = _conv_geom(H, W, kH, kW, stride, padding)
+    g2 = _conv_geom(g1[0], g1[1], kH, kW, 1, padding)
+    if g2[0] <= 0 or g2[1] <= 0:
+        raise ValueError(f"Layer '{name}' (residual_conv): kernels do not fit input {s}")
+    identity = stride == 1 and filters == Cin and g2[0] == H and g2[1] == W
+    if not identity:
+        proj = _conv_geom(H, W, 1, 1, stride, "valid")
+        if proj[0] != g2[0] or proj[1] != g2[1]:
+            raise ValueError(
+                f"Layer '{name}' (residual_conv): shortcut {s} cannot be projected onto block output [{g2[0]}, {g2[1]}, {filters}]"
+            )
+    return {
+        "H": H, "W": W, "Cin": Cin, "kH": kH, "kW": kW, "stride": stride, "padding": padding,
+        "filters": filters, "outH": g2[0], "outW": g2[1], "identityShortcut": identity,
+        "g1": g1, "g2": g2, "proj": _conv_geom(H, W, 1, 1, stride, "valid"),
+    }
+
+
 def _infer_shape(t, c, s, name):
     def fail(msg):
         raise ValueError(f"Layer '{name}' ({t}): {msg}")
@@ -167,11 +201,18 @@ def _infer_shape(t, c, s, name):
         if len(s) != 1:
             fail(f"expects [seqLen], got {s}")
         return [s[0], _int(c.get("embeddingDim"), 8)]
-    if t == "rnn":
+    if t in ("rnn", "lstm", "gru"):
         if len(s) != 2:
             fail(f"expects [seqLen, features], got {s}")
         u = _int(c.get("units"), 32)
         return [s[0], u] if _bool(c.get("returnSequences"), False) else [u]
+    if t == "residual_dense":
+        if len(s) != 1:
+            fail(f"expects rank-1 input, got {s}")
+        return [_residual_width(c, s[0])]
+    if t == "residual_conv":
+        plan = _residual_conv_plan(c, s, name)
+        return [plan["outH"], plan["outW"], plan["filters"]]
     raise ValueError(f"Unsupported layer type '{t}' in layer '{name}'")
 
 
@@ -198,6 +239,34 @@ def _expected_params(t, c, s, out):
     if t == "rnn":
         h = _int(c.get("units"), 32)
         return {"Wxh": [s[1], h], "Whh": [h, h], "b": [h]}
+    if t == "lstm":
+        h = _int(c.get("units"), 32)
+        return {"Wx": [s[1], 4 * h], "Wh": [h, 4 * h], "b": [4 * h]}
+    if t == "gru":
+        h = _int(c.get("units"), 32)
+        return {
+            "Wxz": [s[1], h], "Wxr": [s[1], h], "Wxn": [s[1], h],
+            "Whz": [h, h], "Whr": [h, h], "Whn": [h, h],
+            "bz": [h], "br": [h], "bn": [h],
+        }
+    if t == "residual_dense":
+        w = _residual_width(c, s[0])
+        p = {"W1": [s[0], w], "W2": [w, w]}
+        if _bool(c.get("useBias"), True):
+            p["b1"] = [w]
+            p["b2"] = [w]
+        if w != s[0]:
+            p["Wp"] = [s[0], w]
+        return p
+    if t == "residual_conv":
+        plan = _residual_conv_plan(c, s, "residual_conv")
+        p = {"K1": [plan["kH"], plan["kW"], plan["Cin"], plan["filters"]], "K2": [plan["kH"], plan["kW"], plan["filters"], plan["filters"]]}
+        if _bool(c.get("useBias"), True):
+            p["b1"] = [plan["filters"]]
+            p["b2"] = [plan["filters"]]
+        if not plan["identityShortcut"]:
+            p["Kp"] = [1, 1, plan["Cin"], plan["filters"]]
+        return p
     return {}
 
 
@@ -373,6 +442,130 @@ def _compile(d, c, s, out, P):
                 if ret:
                     seq.append(h)
             return (np.stack(seq, axis=1) if ret else h).astype(F32)
+        return f
+
+    if t == "lstm":
+        units = _int(c.get("units"), 32)
+        ret = _bool(c.get("returnSequences"), False)
+        Wx, Wh, b = P["Wx"].astype(F64), P["Wh"].astype(F64), P["b"].astype(F64)
+
+        def f(x):
+            B, T, _ = x.shape
+            h = np.zeros((B, units), dtype=F64)
+            c_state = np.zeros((B, units), dtype=F64)
+            seq = []
+            xd = x.astype(F64)
+            for step in range(T):
+                pre = xd[:, step, :] @ Wx + h @ Wh + b
+                ig = _sigmoid(pre[:, :units])
+                fg = _sigmoid(pre[:, units:2 * units])
+                gg = np.tanh(pre[:, 2 * units:3 * units])
+                og = _sigmoid(pre[:, 3 * units:4 * units])
+                c_state = fg * c_state + ig * gg
+                h = og * np.tanh(c_state)
+                if ret:
+                    seq.append(h)
+            return (np.stack(seq, axis=1) if ret else h).astype(F32)
+        return f
+
+    if t == "gru":
+        units = _int(c.get("units"), 32)
+        ret = _bool(c.get("returnSequences"), False)
+        Wxz, Wxr, Wxn = P["Wxz"].astype(F64), P["Wxr"].astype(F64), P["Wxn"].astype(F64)
+        Whz, Whr, Whn = P["Whz"].astype(F64), P["Whr"].astype(F64), P["Whn"].astype(F64)
+        bz, br, bn = P["bz"].astype(F64), P["br"].astype(F64), P["bn"].astype(F64)
+
+        def f(x):
+            B, T, _ = x.shape
+            h = np.zeros((B, units), dtype=F64)
+            seq = []
+            xd = x.astype(F64)
+            for step in range(T):
+                xv = xd[:, step, :]
+                z = _sigmoid(xv @ Wxz + h @ Whz + bz)
+                r = _sigmoid(xv @ Wxr + h @ Whr + br)
+                n = np.tanh(xv @ Wxn + (r * h) @ Whn + bn)
+                h = (1.0 - z) * n + z * h
+                if ret:
+                    seq.append(h)
+            return (np.stack(seq, axis=1) if ret else h).astype(F32)
+        return f
+
+    if t == "residual_dense":
+        din = s[0]
+        w = _residual_width(c, din)
+        use_bias = _bool(c.get("useBias"), True)
+        act = _act_name(c)
+        act2 = str(c.get("finalActivation") or "none")
+        scale = _num(c.get("scale"), 1.0)
+        W1, W2 = P["W1"].astype(F64), P["W2"].astype(F64)
+        b1 = P["b1"].astype(F64) if use_bias else None
+        b2 = P["b2"].astype(F64) if use_bias else None
+        Wp = P["Wp"].astype(F64) if w != din else None
+
+        def f(x):
+            if x.ndim != 2 or x.shape[1] != din:
+                raise ValueError(f"Residual Dense '{name}': expected [B, {din}], got {list(x.shape)}")
+            xd = x.astype(F64)
+            h = xd @ W1
+            if use_bias:
+                h = h + b1
+            if act != "none":
+                h = _activation(act, h.astype(F32), 0.01).astype(F64)
+            main = h @ W2
+            if use_bias:
+                main = main + b2
+            skip = xd @ Wp if Wp is not None else xd
+            y = (skip + scale * main).astype(F32)
+            if act2 != "none":
+                y = _activation(act2, y, 0.01)
+            return y
+        return f
+
+    if t == "residual_conv":
+        plan = _residual_conv_plan(c, s, name)
+        H, W_, Cin = plan["H"], plan["W"], plan["Cin"]
+        kH, kW = plan["kH"], plan["kW"]
+        stride = plan["stride"]
+        filters = plan["filters"]
+        use_bias = _bool(c.get("useBias"), True)
+        act = _act_name(c)
+        act2 = str(c.get("finalActivation") or "none")
+        scale = _num(c.get("scale"), 1.0)
+        K1, K2 = P["K1"].astype(F64), P["K2"].astype(F64)
+        b1 = P["b1"].astype(F64) if use_bias else None
+        b2 = P["b2"].astype(F64) if use_bias else None
+        Kp = P["Kp"].astype(F64) if not plan["identityShortcut"] else None
+
+        def conv(xd, K, bias, oh, ow, st, geom):
+            B = xd.shape[0]
+            _, _, pad_h, pad_w = geom
+            pt, pl = pad_h // 2, pad_w // 2
+            xp = np.zeros((B, xd.shape[1] + pad_h, xd.shape[2] + pad_w, xd.shape[3]), dtype=F64)
+            xp[:, pt:pt + xd.shape[1], pl:pl + xd.shape[2], :] = xd
+            y = np.zeros((B, oh, ow, K.shape[3]), dtype=F64)
+            for kh in range(K.shape[0]):
+                for kw in range(K.shape[1]):
+                    patch = xp[:, kh:kh + st * (oh - 1) + 1:st, kw:kw + st * (ow - 1) + 1:st, :]
+                    y += patch @ K[kh, kw]
+            if bias is not None:
+                y += bias
+            return y.astype(F32)
+
+        def f(x):
+            xd = x.astype(F64)
+            h = conv(xd, K1, b1, plan["g1"][0], plan["g1"][1], stride, plan["g1"])
+            if act != "none":
+                h = _activation(act, h, 0.01).astype(F64)
+            main = conv(h, K2, b2, plan["outH"], plan["outW"], 1, plan["g2"])
+            if Kp is not None:
+                skip = conv(xd, Kp, None, plan["proj"][0], plan["proj"][1], stride, plan["proj"])
+            else:
+                skip = x.astype(F32)
+            y = (skip.astype(F64) + scale * main.astype(F64)).astype(F32)
+            if act2 != "none":
+                y = _activation(act2, y, 0.01)
+            return y
         return f
 
     raise ValueError(f"Unsupported layer type '{t}'")

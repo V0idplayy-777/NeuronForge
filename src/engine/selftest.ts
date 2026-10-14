@@ -16,6 +16,45 @@ import { compileExpr } from "../data/expr";
 import { buildCustom } from "../data/custom";
 import { PRESETS, alignToVocab } from "./presets";
 import { compileLayer, makeLayerDef as mkDef } from "./layers";
+import { CpuOps } from "./gpu/cpu";
+import { Accelerator } from "./gpu/executor";
+import { verifyDevice, summarizeChecks } from "./gpu/verify";
+import { broadcastPlan, convGeomFor } from "./gpu/ops";
+import {
+  activationCode,
+  backwardCode,
+  binaryCode,
+  binaryStep,
+  broadcastPlanesStep,
+  col2imStep,
+  gatherStep,
+  im2colStep,
+  matmulStep,
+  poolBwdStep,
+  poolFwdStep,
+  reduceOuterStep,
+  scatterStep,
+  softmaxBwdStep,
+  softmaxStep,
+  unaryBwdStep,
+  unaryStep,
+} from "./webgpu/plan";
+import {
+  simBinary,
+  simBroadcastPlanes,
+  simCol2im,
+  simGather,
+  simIm2col,
+  simMatmul,
+  simPoolBwd,
+  simPoolFwd,
+  simReduceOuter,
+  simScatter,
+  simSoftmax,
+  simSoftmaxBwd,
+  simUnary,
+  simUnaryBwd,
+} from "./webgpu/sim";
 import { TEXT_CORPUS, TEXT_CHARS, LM_SEQ_LEN } from "../data/corpus";
 import { buildMassiveCorpus, buildWordTokenizer, encodeWordsToIds, decodeTokenIds, tokenizeWords, LM2_SEQ_LEN } from "../data/corpusLarge";
 import { sampleFromProbs } from "./sampling";
@@ -576,9 +615,16 @@ export function runSelfTests(): TestResult[] {
       let maxId = 0;
       for (const id of ids) if (id > maxId) maxId = id;
       expect(maxId < tok.vocabSize, `max id ${maxId} >= vocab ${tok.vocabSize}`);
-      // round trip on an in-vocabulary phrase
-      const rt = decodeTokenIds(encodeWordsToIds("the quick brown fox", tok.tokens), tok.tokens, "word");
-      expect(rt === "the quick brown fox", `round trip gave "${rt}"`);
+      // Round trip on a phrase built from tokens that really are in this
+      // vocabulary (the capped vocabulary keeps the most frequent words, so
+      // hand-picked words may legitimately map to <unk>).
+      expect(tok.tokens.includes("the"), `common word "the" missing from the vocabulary`);
+      // Punctuation tokens are re-joined without a preceding space by the
+      // decoder, so build the phrase from plain words.
+      const phrase = tok.tokens.filter((t) => /^[a-z0-9]+$/.test(t)).slice(0, 6).join(" ");
+      expect(phrase.length > 3, `could not build an in-vocabulary phrase (got "${phrase}")`);
+      const rt = decodeTokenIds(encodeWordsToIds(phrase, tok.tokens), tok.tokens, "word");
+      expect(rt === phrase, `round trip gave "${rt}" for "${phrase}"`);
     }),
   );
 
@@ -744,6 +790,449 @@ export function runSelfTests(): TestResult[] {
       expect(enc.length === dataset.meta.inputShape[0], `encoded ${enc.length} features`);
       expect(enc.every((v) => Number.isFinite(v)), "encoded row contains non-finite values");
     }),
+  );
+
+  tests.push(
+    run("LSTM BPTT matches numerical gradient", () => {
+      const layer = compileLayer(
+        mkDef("lstm", { id: "l", name: "l", config: { units: 3, returnSequences: false, forgetBias: 1 } }),
+        [4, 2],
+        new RNG(21),
+        "xavier_uniform",
+      );
+      const x = new Tensor([1, 4, 2], [0.3, -0.1, 0.2, 0.4, -0.3, 0.1, 0.05, 0.2]);
+      const w = [0.5, -1, 2];
+      const scalar = () => {
+        const y = layer.forward(x, false);
+        return y.data[0]! * w[0]! + y.data[1]! * w[1]! + y.data[2]! * w[2]!;
+      };
+      layer.forward(x, false);
+      layer.backward(new Tensor([1, 3], w));
+      const eps = 1e-3;
+      // One weight in the input projection and one in the recurrent projection
+      // (the recurrent one exercises the cell-state gradient path).
+      for (const [name, index] of [
+        ["Wx", 6],
+        ["Wh", 4],
+      ] as const) {
+        const p = layer.params[name]!;
+        const analytic = layer.grads[name]!.data[index]!;
+        const orig = p.data[index]!;
+        p.data[index] = orig + eps;
+        const lp = scalar();
+        p.data[index] = orig - eps;
+        const lm = scalar();
+        p.data[index] = orig;
+        const numeric = (lp - lm) / (2 * eps);
+        expect(approx(analytic, numeric, 5e-2), `${name}[${index}]: analytic ${analytic} numeric ${numeric}`);
+      }
+    }),
+  );
+
+  tests.push(
+    run("GRU BPTT matches numerical gradient", () => {
+      const layer = compileLayer(
+        mkDef("gru", { id: "g", name: "g", config: { units: 3, returnSequences: true } }),
+        [4, 2],
+        new RNG(31),
+        "xavier_uniform",
+      );
+      const x = new Tensor([1, 4, 2], [0.3, -0.1, 0.2, 0.4, -0.3, 0.1, 0.05, 0.2]);
+      const w = new Float32Array(12).map((_, i) => (i % 3) - 1);
+      const scalar = () => {
+        const y = layer.forward(x, false);
+        let acc = 0;
+        for (let i = 0; i < y.size; i++) acc += y.data[i]! * w[i]!;
+        return acc;
+      };
+      layer.forward(x, false);
+      layer.backward(new Tensor([1, 4, 3], w));
+      const eps = 1e-3;
+      for (const [name, index] of [
+        ["Wxz", 4],
+        ["Whn", 2],
+      ] as const) {
+        const p = layer.params[name]!;
+        const analytic = layer.grads[name]!.data[index]!;
+        const orig = p.data[index]!;
+        p.data[index] = orig + eps;
+        const lp = scalar();
+        p.data[index] = orig - eps;
+        const lm = scalar();
+        p.data[index] = orig;
+        const numeric = (lp - lm) / (2 * eps);
+        expect(approx(analytic, numeric, 5e-2), `${name}[${index}]: analytic ${analytic} numeric ${numeric}`);
+      }
+    }),
+  );
+
+  tests.push(
+    run("residual dense block reduces to the identity when its branch is zero", () => {
+      const layer = compileLayer(
+        mkDef("residual_dense", { id: "rd", name: "rd", config: { units: 4, activation: "relu", useBias: true, projection: "auto", scale: 1, finalActivation: "none" } }),
+        [4],
+        new RNG(41),
+        "xavier_uniform",
+      );
+      for (const p of Object.values(layer.params)) p.data.fill(0);
+      const x = new Tensor([2, 4], [0.5, -1, 2, 0.25, -0.5, 0.75, 1.5, -2]);
+      const y = layer.forward(x, false);
+      let worst = 0;
+      for (let i = 0; i < x.size; i++) worst = Math.max(worst, Math.abs(y.data[i]! - x.data[i]!));
+      expect(worst < 1e-7, `identity shortcut broke: worst |y-x| = ${worst}`);
+      // Gradient of the shortcut path: every input must receive at least the
+      // shortcut's contribution.
+      layer.backward(new Tensor([2, 4], [1, 0, 0, 0, 0, 1, 0, 0]));
+      expect(approx(layer.grads.W1!.data[0]!, 0, 1e-6) && approx(layer.grads.W2!.data[0]!, 0, 1e-6), "zero branch should have zero weight gradients");
+    }),
+  );
+
+  tests.push(
+    run("residual conv identity shortcut preserves the input", () => {
+      const layer = compileLayer(
+        mkDef("residual_conv", {
+          id: "rc",
+          name: "rc",
+          config: { filters: 2, kernelSize: 3, stride: 1, padding: "same", activation: "relu", useBias: true, projection: "auto", scale: 1, finalActivation: "none" },
+        }),
+        [5, 5, 2],
+        new RNG(51),
+        "xavier_uniform",
+      );
+      for (const p of Object.values(layer.params)) p.data.fill(0);
+      expect(layer.params.Kp === undefined, "a same-shape stride-1 block must use the identity shortcut (no projection kernel)");
+      const data = new Float32Array(2 * 5 * 5 * 2);
+      for (let i = 0; i < data.length; i++) data[i] = Math.sin(i) * 0.5;
+      const x = new Tensor([2, 5, 5, 2], data);
+      const y = layer.forward(x, false);
+      let worst = 0;
+      for (let i = 0; i < x.size; i++) worst = Math.max(worst, Math.abs(y.data[i]! - x.data[i]!));
+      expect(worst < 1e-7, `identity shortcut broke: worst |y-x| = ${worst}`);
+    }),
+  );
+
+  tests.push(
+    run("residual blocks reject impossible shortcuts", () => {
+      let threw = false;
+      try {
+        compileLayer(mkDef("residual_dense", { id: "x", name: "x", config: { units: 3, projection: "never" } }), [4], new RNG(1), "xavier_uniform");
+      } catch (e) {
+        threw = /identity shortcut/.test(e instanceof Error ? e.message : String(e));
+      }
+      expect(threw, "residual dense with units != input width and projection never should throw");
+      threw = false;
+      try {
+        compileLayer(
+          mkDef("residual_conv", { id: "y", name: "y", config: { filters: 4, kernelSize: 3, stride: 2, padding: "valid", projection: "auto" } }),
+          [5, 5, 2],
+          new RNG(1),
+          "xavier_uniform",
+        );
+      } catch (e) {
+        threw = /padding/.test(e instanceof Error ? e.message : String(e));
+      }
+      expect(threw, "residual conv with valid padding + stride 2 cannot build a matching shortcut");
+    }),
+  );
+
+  return tests;
+}
+
+/**
+ * Checks that need to await the accelerator. Kept separate from the synchronous
+ * suite so the panel can run the fast tests first and stream these in after.
+ */
+export async function runAsyncSelfTests(): Promise<TestResult[]> {
+  const tests: TestResult[] = [];
+  const ops = new CpuOps();
+
+  tests.push(
+    await (async () => {
+      const t0 = performance.now();
+      try {
+        const checks = await verifyDevice(ops);
+        const summary = summarizeChecks(checks);
+        expect(summary.failed === 0, `${summary.failed} of ${checks.length} device ops differ from the reference`);
+        return { name: `device op surface (${checks.length} ops)`, passed: true, message: `worst |diff| ${summary.worst}`, ms: performance.now() - t0 };
+      } catch (e) {
+        return { name: "device op surface", passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
+  );
+
+  tests.push(
+    await (async () => {
+      const t0 = performance.now();
+      const name = "accelerator forward/backward matches the CPU engine";
+      try {
+        const arch: Architecture = {
+          inputShape: [16],
+          inputName: "x",
+          seed: 7,
+          initMethod: "he_normal",
+          layers: [
+            makeLayerDef("reshape", { id: "rs", name: "rs", config: { targetShape: [4, 4, 1] } }),
+            makeLayerDef("conv2d", { id: "c1", name: "c1", config: { filters: 3, kernelSize: 3, stride: 1, padding: "same", useBias: true, activation: "relu" } }),
+            makeLayerDef("residual_conv", { id: "rc", name: "rc", config: { filters: 4, kernelSize: 3, stride: 2, padding: "same", activation: "relu", projection: "auto", scale: 0.7 } }),
+            makeLayerDef("maxpool2d", { id: "mp", name: "mp", config: { poolSize: 2, stride: 2 } }),
+            makeLayerDef("gap2d", { id: "gap", name: "gap" }),
+            makeLayerDef("dense", { id: "d1", name: "d1", config: { units: 3, useBias: true, activation: "softmax" } }),
+          ],
+        };
+        const plain = new SequentialModel(arch);
+        expect(plain.valid, plain.issues[0]?.message ?? "model invalid");
+        // Two independent models with the same seed: `clone()` shares the
+        // parameter tensors with its source, which would hide differences.
+        const accelerated = new SequentialModel(arch);
+        const acc = new Accelerator(accelerated, ops);
+        const rng = new RNG(3);
+        const bx = new Tensor([2, 16], Float32Array.from({ length: 32 }, () => rng.normal()));
+        const dOut = new Tensor([2, 3], [0.5, -0.2, 0.1, -0.3, 0.7, 0.05]);
+        const want = plain.forward(bx, false).output;
+        const got = await acc.runForward(bx, false);
+        let worstFwd = 0;
+        for (let i = 0; i < want.size; i++) worstFwd = Math.max(worstFwd, Math.abs(want.data[i]! - got.data[i]!));
+        expect(worstFwd < 1e-6, `forward differs by ${worstFwd}`);
+        plain.zeroGrads();
+        plain.backward(dOut);
+        accelerated.zeroGrads();
+        await acc.runForward(bx, true);
+        await acc.runBackward(dOut);
+        let worstGrad = 0;
+        for (const layer of plain.layers) {
+          const other = accelerated.layers.find((l) => l.def.id === layer.def.id)!;
+          for (const key of Object.keys(layer.grads)) {
+            const a = layer.grads[key]!.data;
+            const b = other.grads[key]!.data;
+            for (let i = 0; i < a.length; i++) worstGrad = Math.max(worstGrad, Math.abs(a[i]! - b[i]!));
+          }
+        }
+        acc.destroy();
+        expect(worstGrad < 1e-6, `gradients differ by ${worstGrad}`);
+        return { name, passed: true, message: `forward and gradients agree (≤ ${Math.max(worstFwd, worstGrad).toExponential(1)})`, ms: performance.now() - t0 };
+      } catch (e) {
+        return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
+  );
+
+  tests.push(
+    await (async () => {
+      const t0 = performance.now();
+      const name = "accelerator training step matches a pure CPU step";
+      try {
+        const arch: Architecture = {
+          inputShape: [6],
+          inputName: "x",
+          seed: 9,
+          initMethod: "xavier_uniform",
+          layers: [
+            makeLayerDef("dense", { id: "d", name: "d", config: { units: 5, useBias: true, activation: "relu" } }),
+            makeLayerDef("residual_dense", { id: "rd", name: "rd", config: { units: 5, activation: "gelu", projection: "auto", scale: 1 } }),
+            makeLayerDef("dense", { id: "out", name: "out", config: { units: 2, useBias: true, activation: "softmax" } }),
+          ],
+        };
+        const plain = new SequentialModel(arch);
+        const acceleratedModel = new SequentialModel(arch);
+        const acc = new Accelerator(acceleratedModel, ops);
+        const rng = new RNG(13);
+        const bx = new Tensor([4, 6], Float32Array.from({ length: 24 }, () => rng.normal()));
+        const by = new Tensor([4, 2], [1, 0, 0, 1, 1, 0, 0, 1]);
+        const opt = { ...DEFAULT_OPTIMIZER, learningRate: 0.05 };
+        const stateA = createOptimizerState();
+        const stateB = createOptimizerState();
+        for (let step = 0; step < 3; step++) {
+          plain.zeroGrads();
+          const outA = plain.forward(bx, true, false).output;
+          const lossA = computeLoss("cce", outA, by);
+          plain.backward(lossA.grad);
+          optimizerStep(plain, opt, stateA);
+
+          acceleratedModel.zeroGrads();
+          await acc.syncParams();
+          const outB = await acc.runForward(bx, true);
+          const lossB = computeLoss("cce", outB, by);
+          await acc.runBackward(lossB.grad);
+          optimizerStep(acceleratedModel, opt, stateB);
+          expect(approx(lossA.value, lossB.value, 1e-6), `step ${step}: loss ${lossA.value} vs ${lossB.value}`);
+        }
+        let worst = 0;
+        for (const layer of plain.layers) {
+          const other = acceleratedModel.layers.find((l) => l.def.id === layer.def.id)!;
+          for (const key of Object.keys(layer.params)) {
+            const a = layer.params[key]!.data;
+            const b = other.params[key]!.data;
+            for (let i = 0; i < a.length; i++) worst = Math.max(worst, Math.abs(a[i]! - b[i]!));
+          }
+        }
+        acc.destroy();
+        expect(worst < 1e-6, `weights diverged by ${worst} after 3 steps`);
+        return { name, passed: true, message: `3 optimiser steps agree (≤ ${worst.toExponential(1)})`, ms: performance.now() - t0 };
+      } catch (e) {
+        return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
+  );
+
+  tests.push(
+    await (async () => {
+      const t0 = performance.now();
+      const name = "WGSL kernel arithmetic matches the CPU reference";
+      try {
+        const ops = new CpuOps();
+        const rng = new RNG(0xc0ffee);
+        const fill = (n: number, scale = 1): Float32Array => {
+          const out = new Float32Array(n);
+          for (let i = 0; i < n; i++) out[i] = rng.normal() * scale;
+          return out;
+        };
+        const host = async (data: Float32Array, shape: number[]) => ops.fromHost(data, shape);
+        const worstOf = (a: Float32Array, b: Float32Array): number => {
+          let worst = 0;
+          for (let i = 0; i < a.length; i++) worst = Math.max(worst, Math.abs(a[i]! - b[i]!));
+          return worst;
+        };
+
+        // matmul, including a size that straddles the 16×16 tile
+        {
+          const M = 17, N = 19, K = 23;
+          const a = fill(M * K);
+          const b = fill(K * N);
+          const plan = matmulStep(M, N, K, false, false);
+          const got = simMatmul(plan.params.toU32Array(), a, b);
+          const want = await ops.toHost(await ops.matmul(await host(a, [M, K]), await host(b, [K, N]), false, false));
+          expect(worstOf(want, got) < 1e-4, `matmul worst |diff| ${worstOf(want, got)}`);
+          expect(
+            plan.grid[0] * 16 >= N && plan.grid[1] * 16 >= M,
+            `matmul grid ${plan.grid[0]}×${plan.grid[1]} does not cover ${M}×${N}`,
+          );
+        }
+
+        // unary ops and every activation, forward and backward
+        {
+          const x = fill(37, 2);
+          for (const [op, extra] of [
+            ["neg", 0],
+            ["abs", 0],
+            ["square", 0],
+            ["scale", 1.7],
+            ["clip", 0],
+          ] as const) {
+            const step = unaryStep(x.length, op === "neg" ? 1 : op === "abs" ? 2 : op === "square" ? 3 : op === "scale" ? 4 : 5, extra, 0.9);
+            const got = simUnary(step.params.toU32Array(), x);
+            const want = await ops.toHost(await ops.unary(op, await host(x, [37]), extra, 0.9));
+            expect(worstOf(want, got) < 1e-6, `unary ${op} worst |diff| ${worstOf(want, got)}`);
+          }
+          const dx = await host(x, [37]);
+          for (const act of ["relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh"]) {
+            const fwd = await ops.activationFwd(act, dx, 0.1);
+            const wantY = await ops.toHost(fwd);
+            const gotY = simUnary(unaryStep(x.length, activationCode(act), 0.1, 0).params.toU32Array(), x);
+            expect(worstOf(wantY, gotY) < 1e-6, `activation ${act} worst |diff| ${worstOf(wantY, gotY)}`);
+
+            const g = fill(37);
+            const wantDx = await ops.toHost(await ops.activationBwd(act, dx, fwd, await host(g, [37]), 0.1));
+            const gotDx = simUnaryBwd(unaryBwdStep(x.length, backwardCode(act), 0.1).params.toU32Array(), x, wantY, g);
+            expect(worstOf(wantDx, gotDx) < 1e-5, `activation bwd ${act} worst |diff| ${worstOf(wantDx, gotDx)}`);
+          }
+        }
+
+        // broadcasting (the four-axis stride plan) and softmax rows
+        {
+          const a = fill(12);
+          const b = fill(4);
+          for (const op of ["add", "sub", "mul", "div"] as const) {
+            const plan = broadcastPlan([3, 4], [4]);
+            const params = binaryStep(12, binaryCode(op), plan.out4, plan.a4, plan.b4).params.toU32Array();
+            const got = simBinary(params, a, b);
+            const want = await ops.toHost(await ops.binary(op, await host(a, [3, 4]), await host(b, [4])));
+            expect(worstOf(want, got) < 1e-6, `binary ${op} worst |diff| ${worstOf(want, got)}`);
+          }
+          const x = fill(390, 2);
+          const params = softmaxStep(130, 3).params.toU32Array();
+          const got = simSoftmax(params, x);
+          const want = await ops.toHost(await ops.softmaxLast(await host(x, [3, 130])));
+          expect(worstOf(want, got) < 1e-6, `softmax worst |diff| ${worstOf(want, got)}`);
+          const g = fill(390);
+          const back = simSoftmaxBwd(softmaxBwdStep(130, 3).params.toU32Array(), want, g);
+          const wantBack = await ops.toHost(await ops.softmaxBackward(await host(want, [3, 130]), await host(g, [3, 130])));
+          expect(worstOf(wantBack, back) < 1e-6, `softmax backward worst |diff| ${worstOf(wantBack, back)}`);
+        }
+
+        // reducers and the global-average-pooling inverse
+        {
+          const x = fill(72);
+          for (const mode of ["sum", "mean"] as const) {
+            // [2,3,3,4] with group = 2: inner 4, outer 72/4/2 = 9.
+            const got = simReduceOuter(reduceOuterStep(9, 4, 2, mode).params.toU32Array(), x);
+            const want = await ops.toHost(await ops.reduceOuter(mode, await host(x, [2, 3, 3, 4]), 2));
+            expect(worstOf(want, got) < 1e-5, `reduceOuter ${mode} worst |diff| ${worstOf(want, got)}`);
+          }
+          const plane = fill(8);
+          const geom = { B: 2, H: 3, W: 3, C: 4 };
+          const got = simBroadcastPlanes(broadcastPlanesStep(72, 36, 4, 0.25).params.toU32Array(), plane);
+          const want = await ops.toHost(await ops.broadcastPlanes(await host(plane, [2, 4]), geom, 0.25));
+          expect(worstOf(want, got) < 1e-6, `broadcastPlanes worst |diff| ${worstOf(want, got)}`);
+        }
+
+        // convolution: im2col + matmul (forward) and matmul + col2im (input gradient)
+        {
+          const g = convGeomFor(2, 6, 6, 3, 4, { kernelSize: 3, stride: 1, padding: "same" });
+          const x = fill(2 * 6 * 6 * 3);
+          const k = fill(3 * 3 * 3 * 4);
+          const col = simIm2col(im2colStep(g, 4 * 3 * 3 * 3).params.toU32Array(), x);
+          const got = simMatmul(matmulStep(2 * g.outH * g.outW, 4, 27, false, false).params.toU32Array(), col, k);
+          const want = await ops.toHost(await ops.conv2d(await host(x, [2, 6, 6, 3]), await host(k, [3, 3, 3, 4]), null, g));
+          expect(worstOf(want, got) < 1e-4, `conv im2col+matmul worst |diff| ${worstOf(want, got)}`);
+
+          const dy = fill(2 * g.outH * g.outW * 4);
+          const dcol = simMatmul(matmulStep(2 * g.outH * g.outW, 27, 4, false, true).params.toU32Array(), dy, k);
+          const gotDx = simCol2im(col2imStep(g, 2 * 6 * 6 * 3).params.toU32Array(), dcol);
+          const wantDx = await ops.toHost(await ops.conv2dInputGrad(await host(dy, [2, g.outH, g.outW, 4]), await host(k, [3, 3, 3, 4]), g));
+          expect(worstOf(wantDx, gotDx) < 1e-4, `conv matmul+col2im worst |diff| ${worstOf(wantDx, gotDx)}`);
+        }
+
+        // pooling forward/backward, including the overlapping-window case
+        {
+          const g = { B: 2, H: 5, W: 5, C: 2, pool: 2, stride: 1, outH: 4, outW: 4 };
+          const x = fill(2 * 5 * 5 * 2, 2);
+          for (const mode of ["max", "avg"] as const) {
+            const got = simPoolFwd(poolFwdStep(mode, g, 64).params.toU32Array(), x);
+            const want = await ops.toHost(await ops.pool2d(mode, await host(x, [2, 5, 5, 2]), g));
+            expect(worstOf(want, got) < 1e-6, `pool ${mode} fwd worst |diff| ${worstOf(want, got)}`);
+
+            const dy = fill(64);
+            const gotB = simPoolBwd(poolBwdStep(mode, g, 50).params.toU32Array(), x, dy);
+            const wantB = await ops.toHost(await ops.pool2dBackward(mode, await host(x, [2, 5, 5, 2]), await host(dy, [2, 4, 4, 2]), g));
+            expect(worstOf(wantB, gotB) < 1e-6, `pool ${mode} bwd worst |diff| ${worstOf(wantB, gotB)}`);
+          }
+        }
+
+        // embedding gather/scatter with duplicate and out-of-range ids
+        {
+          const w = fill(36);
+          const ids = Float32Array.from([-3, 8, 3, 3, 99, 1]);
+          const got = simGather(gatherStep(24, 4, 9).params.toU32Array(), w, ids);
+          const want = await ops.toHost(await ops.gatherRows(await host(w, [9, 4]), await host(ids, [6]), 4));
+          expect(worstOf(want, got) < 1e-6, `gather worst |diff| ${worstOf(want, got)}`);
+
+          const grad = fill(24);
+          const dup = Float32Array.from([2, 2, 0, 8, 5, 2]);
+          const gotS = simScatter(scatterStep(36, 4, 9, 6).params.toU32Array(), grad, dup);
+          const wantS = await ops.toHost(await ops.scatterRows(await host(grad, [6, 4]), await host(dup, [6]), 4, 9));
+          expect(worstOf(wantS, gotS) < 1e-6, `scatter worst |diff| ${worstOf(wantS, gotS)}`);
+        }
+
+        return {
+          name,
+          passed: true,
+          message: "every kernel reproduces the CPU reference on the parameters the device sends",
+          ms: performance.now() - t0,
+        };
+      } catch (e) {
+        return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
   );
 
   return tests;

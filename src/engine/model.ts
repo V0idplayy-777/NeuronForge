@@ -221,6 +221,21 @@ export class SequentialModel {
   }
 }
 
+/**
+ * Per-layer gradient norms. `backward` reports them as it walks the layers; the
+ * accelerated path downloads gradients first and uses this instead, so both
+ * backends report the same numbers.
+ */
+export function gradNorms(model: SequentialModel): { id: string; name: string; gradNorm: number }[] {
+  return model.layers.map((layer) => {
+    let acc = 0;
+    for (const t of Object.values(layer.grads)) {
+      for (let k = 0; k < t.size; k++) acc += t.data[k]! * t.data[k]!;
+    }
+    return { id: layer.def.id, name: layer.def.name, gradNorm: Math.sqrt(acc) };
+  });
+}
+
 export function emptyArchitecture(inputShape: number[] = [2], seed = 42, initMethod: InitMethod = "he_normal"): Architecture {
   return {
     inputShape,
