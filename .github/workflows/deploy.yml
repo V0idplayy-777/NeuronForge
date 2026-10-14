@@ -1,5 +1,5 @@
 
-name: Deploy NeuronForge to GitHub Pages
+name: Deploy NeuronForge to GitHub Pages!
 
 on:
   push:
