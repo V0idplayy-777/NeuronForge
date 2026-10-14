@@ -1,11 +1,21 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useStore } from "../store";
 import { Button, Field, Input, Select, Panel, Stat, Badge } from "../components/ui";
-import { BUILTIN_INFO, datasetStats, generateBuiltin, type BuiltinId } from "../data/datasets";
-import { DEFAULT_CSV_CONFIG, parseCsv, type CsvImportConfig } from "../data/csv";
+import { BUILTIN_INFO, BPE_VOCAB_MAX, BPE_VOCAB_MIN, datasetStats, generateBuiltin, type BuiltinId } from "../data/datasets";
+import { CSV_MAX_ROWS, DEFAULT_CSV_CONFIG, parseCsvFile, type CsvImportConfig } from "../data/csv";
 import { materializeCsv } from "../data/preprocess";
 import { compileExpr } from "../data/expr";
 import type { FormulaSpec } from "../data/custom";
+import {
+  DEFAULT_IMAGE_CONFIG,
+  IMAGE_LIMITS,
+  buildImageDataset,
+  readImageFiles,
+  type ImageImportConfig,
+  type ImageRow,
+} from "../data/images";
+import { GENERATORS, generatorShape, type GeneratorValue } from "../data/generators";
+import type { PreparedDataset } from "../data/datasets";
 import { Scatter } from "../components/Charts";
 import { fmt, fmtInt, fmtShape } from "../lib/format";
 import { cn } from "../utils/cn";
@@ -19,7 +29,9 @@ export function DatasetStudio() {
   const [csvCfg, setCsvCfg] = useState<CsvImportConfig>(DEFAULT_CSV_CONFIG);
   const [csvPreview, setCsvPreview] = useState<{ headers: string[]; rows: string[][] } | null>(null);
   const [csvWarn, setCsvWarn] = useState<string[]>([]);
+  const [csvProgress, setCsvProgress] = useState<{ rows: number; bytes: number; total: number } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const abortRef = useRef<{ aborted: boolean }>({ aborted: false });
 
   const scatter = useMemo(() => {
     if (ds.meta.inputShape.length !== 1 || ds.meta.inputShape[0] !== 2) return null;
@@ -86,6 +98,18 @@ export function DatasetStudio() {
             <Field label="Classes">
               <Input type="number" min={2} max={5} value={s.synth.classes} onChange={(e) => s.setSynth({ classes: Number(e.target.value) || 2 }, false)} />
             </Field>
+            {(s.builtinId === "tiny_text_bpe" || s.builtinId === "tiny_text_2_bpe") && (
+              <Field label="Subword vocab" hint={`${BPE_VOCAB_MIN}–${BPE_VOCAB_MAX} learned BPE tokens. Bigger vocabularies compress the text further but widen the output layer.`}>
+                <Input
+                  type="number"
+                  min={BPE_VOCAB_MIN}
+                  max={BPE_VOCAB_MAX}
+                  step={32}
+                  value={s.synth.bpeVocab ?? (s.builtinId === "tiny_text_bpe" ? 320 : 512)}
+                  onChange={(e) => s.setSynth({ bpeVocab: Number(e.target.value) || undefined }, false)}
+                />
+              </Field>
+            )}
             <Field label="Train %">
               <Input type="number" step={0.05} value={s.synth.trainFrac} onChange={(e) => s.setSynth({ trainFrac: Number(e.target.value) }, false)} />
             </Field>
@@ -140,9 +164,12 @@ export function DatasetStudio() {
           <SampleTable ds={ds} />
         </Panel>
 
+        <TokenizerPanel ds={ds} />
+
         <Panel title="Import CSV">
           <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-            Parsing is local. Quoted fields and missing values are handled. Normalization statistics are fit on the training split only.
+            Parsing is local and streamed in chunks, so multi-megabyte exports never have to be held in memory twice. Quoted fields, embedded newlines and missing values are handled;
+            up to {CSV_MAX_ROWS.toLocaleString()} rows are kept and normalization statistics are fit on the training split only.
           </p>
           <input
             type="file"
@@ -150,13 +177,24 @@ export function DatasetStudio() {
             className="text-xs text-slate-300"
             onChange={async (e) => {
               setErr(null);
+              setCsvPreview(null);
               const f = e.target.files?.[0];
               if (!f) return;
-              const text = await f.text();
+              setCsvProgress({ rows: 0, bytes: 0, total: f.size ?? 0 });
+              const signal = { aborted: false };
+              abortRef.current = signal;
               try {
-                const parsed = parseCsv(text);
+                const parsed = await parseCsvFile(f, {
+                  onProgress: (stats) => setCsvProgress({ rows: stats.rows, bytes: stats.bytes, total: stats.totalBytes }),
+                  signal,
+                });
                 if (!parsed.headers.length) throw new Error("No columns found.");
                 setCsvPreview(parsed);
+                setCsvWarn(
+                  parsed.truncated
+                    ? [`File had more than ${CSV_MAX_ROWS.toLocaleString()} rows — the importer kept the first ${parsed.rows.length.toLocaleString()}.`]
+                    : [],
+                );
                 const nums = parsed.headers.map((_, i) => i);
                 setCsvCfg({
                   ...DEFAULT_CSV_CONFIG,
@@ -165,9 +203,22 @@ export function DatasetStudio() {
                 });
               } catch (er) {
                 setErr(er instanceof Error ? er.message : String(er));
+              } finally {
+                setCsvProgress(null);
               }
             }}
           />
+          {csvProgress && (
+            <div className="mt-2 flex items-center gap-2 text-[11px] text-cyan-200">
+              <span>
+                Reading… {csvProgress.rows.toLocaleString()} rows
+                {csvProgress.total > 0 ? ` · ${Math.min(100, Math.round((csvProgress.bytes / csvProgress.total) * 100))}% of ${(csvProgress.total / 1_048_576).toFixed(1)} MB` : ""}
+              </span>
+              <Button size="sm" variant="ghost" onClick={() => (abortRef.current.aborted = true)}>
+                Cancel
+              </Button>
+            </div>
+          )}
           {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
           {csvPreview && (
             <div className="mt-3 space-y-3">
@@ -284,6 +335,8 @@ export function DatasetStudio() {
 
         <DrawPanel />
         <FormulaPanel />
+        <SyntheticPanel />
+        <ImagePanel />
       </div>
     </div>
   );
@@ -602,4 +655,455 @@ function classHist(ds: ReturnType<typeof generateBuiltin>): { label: string; n: 
     counts[best]++;
   }
   return counts.map((n, i) => ({ label: ds.meta.classNames?.[i] ?? String(i), n }));
+}
+
+/* ------------------------------- Tokenizer / BPE inspector ------------------------------- */
+
+interface TokenStats {
+  level: string;
+  vocab: number;
+  merges: number;
+  seqLen: number;
+  tokens: number;
+  chars: number;
+  unk: number;
+  longest: string[];
+  sample: string;
+  oovRate?: number;
+}
+
+function tokenizerStats(ds: PreparedDataset): TokenStats | null {
+  const tok = ds.meta.tokenizer;
+  if (!tok) return null;
+  const seq = tok.seqLen;
+  const rows = Math.min(ds.train.xs.shape[0]!, 200);
+  const flat = ds.train.xs.data;
+  let tokens = 0;
+  let chars = 0;
+  let unk = 0;
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < seq; j++) {
+      const id = flat[i * seq + j]!;
+      const text = tok.tokens[id];
+      if (text === undefined) continue;
+      tokens++;
+      chars += text.length;
+      if (id === 0) unk++;
+    }
+  }
+  const longest = tok.tokens
+    .slice()
+    .sort((a, b) => b.length - a.length || a.localeCompare(b))
+    .slice(0, 8);
+  const sampleIds: number[] = [];
+  for (let j = 0; j < Math.min(seq, 48); j++) sampleIds.push(flat[j]!);
+  return {
+    level: tok.level,
+    vocab: tok.tokens.length,
+    merges: tok.merges?.length ?? 0,
+    seqLen: seq,
+    tokens,
+    chars,
+    unk,
+    longest,
+    sample: sampleIds.map((id) => tok.tokens[id] ?? "").join(""),
+    oovRate: tok.oovRate,
+  };
+}
+
+function TokenizerPanel({ ds }: { ds: PreparedDataset }) {
+  const st = useMemo(() => tokenizerStats(ds), [ds]);
+  if (!st) return null;
+  const perToken = st.tokens > 0 ? st.chars / st.tokens : 0;
+  return (
+    <Panel title="Tokenizer" actions={<Badge tone={st.level === "bpe" ? "violet" : "cyan"}>{st.level}</Badge>}>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <Stat label="Vocabulary" value={st.vocab.toLocaleString()} />
+        <Stat label="Context" value={`${st.seqLen} tokens`} />
+        <Stat label="Learned merges" value={st.level === "bpe" ? st.merges.toLocaleString() : "—"} />
+        <Stat label="Chars / token" value={perToken.toFixed(2)} />
+      </div>
+      <p className="text-[11px] text-slate-400 mt-3 leading-relaxed">
+        {st.level === "bpe"
+          ? `Subword tokenizer learned on the training text: ${st.merges.toLocaleString()} merge rules were added to the base characters, so each token carries ${perToken.toFixed(2)} characters on average instead of one. The rules ride along in exported bundles, so the exported runtime re-tokenises prompts exactly like this app.`
+          : st.level === "word"
+            ? `Word-level tokenizer: ${st.vocab.toLocaleString()} vocabulary entries, ${(100 * (st.oovRate ?? 0)).toFixed(1)}% of corpus tokens fall outside the cap and map to ${st.tokens === 0 ? "`<unk>`" : "`" + (ds.meta.tokenizer?.tokens[0] ?? "") + "`"}.`
+            : `Character-level tokenizer: one token per character, ${st.vocab} tokens.`}
+      </p>
+      <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">First training window, decoded</div>
+          <div className="text-[11px] font-mono text-slate-200 bg-black/40 border border-white/8 rounded-md px-2 py-1.5 whitespace-pre-wrap break-words">
+            {st.sample}
+          </div>
+          <div className="text-[10px] text-slate-500 mt-2">
+            {st.tokens.toLocaleString()} tokens inspected in the first {Math.min(200, ds.train.xs.shape[0]!)} windows ·{" "}
+            {st.unk === 0 ? "no unknown tokens" : `${((100 * st.unk) / Math.max(1, st.tokens)).toFixed(2)}% unknown`}
+          </div>
+        </div>
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">
+            {st.level === "bpe" ? "Longest learned tokens" : "Token sample"}
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {st.longest.map((t, i) => (
+              <span key={i} className="text-[11px] font-mono text-slate-200 bg-white/5 border border-white/8 rounded px-1.5 py-0.5">
+                {t === "\n" ? "\\n" : t === " " ? "␣" : t}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/* ------------------------------- Synthetic generators ------------------------------- */
+
+function SyntheticPanel() {
+  const s = useStore();
+  const [genId, setGenId] = useState(GENERATORS[0]!.id);
+  const def = GENERATORS.find((g) => g.id === genId) ?? GENERATORS[0]!;
+  const [values, setValues] = useState<Record<string, GeneratorValue>>(() => ({ ...GENERATORS[0]!.defaults }));
+  const [n, setN] = useState(400);
+  const [noise, setNoise] = useState(0.08);
+  const [seed, setSeed] = useState(11);
+  const [err, setErr] = useState<string | null>(null);
+  const shape = generatorShape(def, values);
+
+  const preview = useMemo(() => {
+    try {
+      const ds = def.build({ values, n: Math.min(300, n), noise, seed, trainFrac: 0.7, valFrac: 0.15, testFrac: 0.15 });
+      return ds;
+    } catch {
+      return null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [def, values, n, noise, seed]);
+
+  const scatter = useMemo(() => {
+    if (!preview || preview.meta.inputShape.length !== 1 || preview.meta.inputShape[0] !== 2) return null;
+    const pts: { x: number; y: number; cls: number }[] = [];
+    const B = Math.min(400, preview.allX.shape[0]!);
+    const yDim = preview.allY.size / preview.allY.shape[0]!;
+    for (let i = 0; i < B; i++) {
+      let cls = 0;
+      if (yDim === 1) cls = preview.allY.data[i]! >= 0.5 ? 1 : 0;
+      else {
+        let best = 0;
+        let bv = -Infinity;
+        for (let c = 0; c < yDim; c++) {
+          const v = preview.allY.data[i * yDim + c]!;
+          if (v > bv) {
+            bv = v;
+            best = c;
+          }
+        }
+        cls = best;
+      }
+      pts.push({ x: preview.allX.data[i * 2]!, y: preview.allX.data[i * 2 + 1]!, cls });
+    }
+    return pts;
+  }, [preview]);
+
+  return (
+    <Panel title="Synthetic generators" actions={<Badge tone="violet">seeded</Badge>}>
+      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+        Beyond the formula and draw tools: parameterised families that stress specific failure modes — depth, imbalance, sequence memory, reconstruction bottlenecks. Every generator is a
+        pure function of its parameters and the seed, so a dataset you like can be regenerated exactly.
+      </p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <Field label="Generator">
+          <Select
+            value={genId}
+            onChange={(e) => {
+              const next = GENERATORS.find((g) => g.id === e.target.value) ?? GENERATORS[0]!;
+              setGenId(next.id);
+              setValues({ ...next.defaults });
+              setErr(null);
+            }}
+          >
+            {GENERATORS.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.name}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Samples">
+          <Input type="number" min={20} max={20000} value={n} onChange={(e) => setN(Number(e.target.value) || 100)} />
+        </Field>
+        {def.params.map((param) =>
+          param.kind === "select" ? (
+            <Field key={param.key} label={param.label} hint={param.hint}>
+              <Select value={String(values[param.key] ?? def.defaults[param.key])} onChange={(e) => setValues({ ...values, [param.key]: e.target.value })}>
+                {(param.options ?? []).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          ) : (
+            <Field key={param.key} label={param.label} hint={param.hint}>
+              <Input
+                type="number"
+                min={param.min}
+                max={param.max}
+                step={param.step ?? 1}
+                value={Number(values[param.key] ?? def.defaults[param.key] ?? 0)}
+                onChange={(e) => setValues({ ...values, [param.key]: Number(e.target.value) })}
+              />
+            </Field>
+          ),
+        )}
+        <Field label="Noise σ">
+          <Input type="number" step={0.01} min={0} max={1} value={noise} onChange={(e) => setNoise(Number(e.target.value))} />
+        </Field>
+        <Field label="Seed">
+          <Input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value) || 1)} />
+        </Field>
+      </div>
+      <div className="mt-3 text-[11px] text-slate-400 leading-relaxed">{def.detail}</div>
+      <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-300 font-mono">
+        <span>input {shape.shape.join("×")}</span>
+        <span>output {shape.out}</span>
+        <span>task {def.task}</span>
+        <span>loss {def.loss}</span>
+        {shape.classes && <span>classes {shape.classes.join(", ")}</span>}
+      </div>
+      {scatter && (
+        <div className="mt-3">
+          <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-2">Preview (first 300)</div>
+          <Scatter points={scatter} colors={COLORS} />
+        </div>
+      )}
+      <div className="mt-3 flex items-center gap-2">
+        <Button
+          onClick={() => {
+            setErr(null);
+            try {
+              const ds = def.build({
+                values,
+                n,
+                noise,
+                seed,
+                trainFrac: s.synth.trainFrac,
+                valFrac: s.synth.valFrac,
+                testFrac: Math.max(0, 1 - s.synth.trainFrac - s.synth.valFrac),
+              });
+              s.loadCustomDataset(ds);
+              s.setInputShape(ds.meta.inputShape);
+            } catch (e) {
+              setErr(e instanceof Error ? e.message : String(e));
+            }
+          }}
+        >
+          Build dataset
+        </Button>
+        <span className="text-[10px] text-slate-500">Split uses the Generator fractions ({Math.round(s.synth.trainFrac * 100)}/{Math.round(s.synth.valFrac * 100)}/{Math.round(Math.max(0, 1 - s.synth.trainFrac - s.synth.valFrac) * 100)}).</span>
+      </div>
+      {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
+    </Panel>
+  );
+}
+
+/* ------------------------------- Image import ------------------------------- */
+
+function ImagePanel() {
+  const s = useStore();
+  const [cfg, setCfg] = useState<ImageImportConfig>(DEFAULT_IMAGE_CONFIG);
+  const [files, setFiles] = useState<File[]>([]);
+  const [progress, setProgress] = useState<{ done: number; total: number; name: string } | null>(null);
+  const [rows, setRows] = useState<ImageRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [labels, setLabels] = useState<string[]>([]);
+
+  const decode = async (list: File[], config: ImageImportConfig): Promise<void> => {
+    setErr(null);
+    setRows(null);
+    if (list.length === 0) return;
+    if (list.length > IMAGE_LIMITS.maxFiles) {
+      setErr(`Selected ${list.length} files — the importer accepts up to ${IMAGE_LIMITS.maxFiles.toLocaleString()} per dataset.`);
+      return;
+    }
+    setProgress({ done: 0, total: list.length, name: list[0]!.name });
+    try {
+      const decoded = await readImageFiles(list, config, (done, total, name) => setProgress({ done, total, name }));
+      setRows(decoded);
+      setLabels([...new Set(decoded.map((r) => r.label))].sort());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProgress(null);
+    }
+  };
+
+  const thumbs = useMemo(() => {
+    if (!rows || rows.length === 0) return [];
+    const w = cfg.width;
+    const h = cfg.height;
+    return rows.slice(0, 12).map((row) => {
+      const canvas = typeof document !== "undefined" ? document.createElement("canvas") : null;
+      if (!canvas) return "";
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return "";
+      const img = ctx.createImageData(w, h);
+      for (let i = 0; i < w * h; i++) {
+        const v = Math.max(0, Math.min(255, Math.round(row.pixels[i]! * 255)));
+        img.data[i * 4] = v;
+        img.data[i * 4 + 1] = v;
+        img.data[i * 4 + 2] = v;
+        img.data[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      return canvas.toDataURL();
+    });
+  }, [rows, cfg.width, cfg.height]);
+
+  return (
+    <Panel title="Import images" actions={<Badge tone="violet">local</Badge>}>
+      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+        Pick individual files or a whole folder. Images are rasterised in the page, resized to the input size, optionally converted to grayscale and normalised to [0, 1] or [-1, 1].
+        Augmentation is applied to the training split only — flips, 90° rotations, small arbitrary rotations, shifts, brightness/contrast jitter and Gaussian noise — so validation and
+        test stay clean. Labels come from the file name (text before the first <span className="font-mono">_ - . or space</span>) or from the folder name.
+      </p>
+      <input
+        type="file"
+        accept="image/*"
+        multiple
+        className="text-xs text-slate-300"
+        onChange={(e) => {
+          const list = [...(e.target.files ?? [])];
+          setFiles(list);
+          void decode(list, cfg);
+        }}
+      />
+      <input
+        type="file"
+        multiple
+        className="mt-2 block text-xs text-slate-300"
+        {...({ webkitdirectory: "" } as Record<string, string>)}
+        onChange={(e) => {
+          const list = [...(e.target.files ?? [])].filter((f) => /\.(png|jpe?g|webp|bmp|gif)$/i.test(f.name));
+          setFiles(list);
+          void decode(list, cfg);
+        }}
+      />
+      {progress && (
+        <div className="mt-2 text-[11px] text-cyan-200">
+          Decoding {progress.done}/{progress.total} — {progress.name || "done"}
+        </div>
+      )}
+      <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-2">
+        <Field label="Width">
+          <Input type="number" min={4} max={IMAGE_LIMITS.maxSide} value={cfg.width} onChange={(e) => setCfg({ ...cfg, width: Number(e.target.value) || 16 })} />
+        </Field>
+        <Field label="Height">
+          <Input type="number" min={4} max={IMAGE_LIMITS.maxSide} value={cfg.height} onChange={(e) => setCfg({ ...cfg, height: Number(e.target.value) || 16 })} />
+        </Field>
+        <Field label="Channels">
+          <Select value={String(cfg.channels)} onChange={(e) => setCfg({ ...cfg, channels: Number(e.target.value) === 3 ? 3 : 1 })}>
+            <option value="1">grayscale</option>
+            <option value="3">RGB</option>
+          </Select>
+        </Field>
+        <Field label="Resize">
+          <Select value={cfg.resample} onChange={(e) => setCfg({ ...cfg, resample: e.target.value as ImageImportConfig["resample"] })}>
+            <option value="bilinear">bilinear (best quality)</option>
+            <option value="nearest">nearest (matches exported runtime)</option>
+          </Select>
+        </Field>
+        <Field label="Values">
+          <Select value={cfg.scale} onChange={(e) => setCfg({ ...cfg, scale: e.target.value as ImageImportConfig["scale"] })}>
+            <option value="01">[0, 1]</option>
+            <option value="pm1">[-1, 1]</option>
+          </Select>
+        </Field>
+        <Field label="Labels from">
+          <Select value={cfg.labelMode} onChange={(e) => setCfg({ ...cfg, labelMode: e.target.value as ImageImportConfig["labelMode"] })}>
+            <option value="prefix">file name prefix</option>
+            <option value="folder">folder name</option>
+            <option value="all">single class (autoencoder)</option>
+          </Select>
+        </Field>
+        <Field label="Augmented copies" hint="Added to the training split only.">
+          <Input type="number" min={0} max={32} value={cfg.copies} onChange={(e) => setCfg({ ...cfg, copies: Number(e.target.value) || 0 })} />
+        </Field>
+        <Field label="Max rotation°">
+          <Input type="number" min={0} max={45} value={cfg.rotate} onChange={(e) => setCfg({ ...cfg, rotate: Number(e.target.value) || 0 })} />
+        </Field>
+        <Field label="Max shift px">
+          <Input type="number" min={0} max={16} value={cfg.shift} onChange={(e) => setCfg({ ...cfg, shift: Number(e.target.value) || 0 })} />
+        </Field>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-300">
+        {([
+          ["flipH", "horizontal flips"],
+          ["flipV", "vertical flips"],
+          ["rotate90", "90° rotations"],
+        ] as const).map(([key, label]) => (
+          <label key={key} className="flex items-center gap-1">
+            <input type="checkbox" checked={cfg[key]} onChange={(e) => setCfg({ ...cfg, [key]: e.target.checked })} />
+            {label}
+          </label>
+        ))}
+        <span className="text-slate-500">
+          brightness ±{cfg.brightness} · contrast ±{cfg.contrast} · noise σ {cfg.noise}
+        </span>
+      </div>
+      {thumbs.length > 0 && (
+        <div className="mt-3">
+          <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-2">
+            Preview · {rows?.length ?? 0} images · {labels.length} label{labels.length === 1 ? "" : "s"}
+            {labels.length > 0 && labels.length <= 8 ? ` (${labels.join(", ")})` : ""}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {thumbs.map((src, i) => (
+              <div key={i} className="flex flex-col items-center gap-1">
+                {src ? (
+                  <img src={src} width={Math.max(28, Math.min(64, cfg.width))} height={Math.max(28, Math.min(64, cfg.height))} className="rounded border border-white/10" style={{ imageRendering: "pixelated" }} alt={rows?.[i]?.label ?? ""} />
+                ) : (
+                  <div className="w-8 h-8 rounded border border-white/10 bg-black/40" />
+                )}
+                <span className="text-[9px] text-slate-500">{rows?.[i]?.label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
+      <div className="mt-3 flex items-center gap-2">
+        <Button
+          disabled={!rows || rows.length < 4}
+          onClick={() => {
+            setErr(null);
+            try {
+              const ds = buildImageDataset(rows ?? [], cfg);
+              s.loadCustomDataset(ds);
+              s.setInputShape(ds.meta.inputShape);
+            } catch (e) {
+              setErr(e instanceof Error ? e.message : String(e));
+            }
+          }}
+        >
+          Build dataset from {files.length || 0} images
+        </Button>
+        <Button
+          variant="ghost"
+          disabled={files.length === 0}
+          onClick={() => {
+            void decode(files, cfg);
+          }}
+        >
+          Re-decode with current settings
+        </Button>
+      </div>
+      <p className="text-[10px] text-slate-500 mt-2">
+        Datasets above {(400_000).toLocaleString()} values are not stored with the project (re-import after reload). Larger inputs train faster at 16×16 or 24×24.
+      </p>
+    </Panel>
+  );
 }

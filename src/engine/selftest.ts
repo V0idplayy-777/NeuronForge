@@ -9,11 +9,22 @@ import { computeLoss } from "./losses";
 import { exportModel, importModel, verifyRoundTrip } from "./serialize";
 import { classificationFromPred, regressionFromPred } from "./metrics";
 import { generateBuiltin, DEFAULT_SYNTH, SEQ_WINDOW } from "../data/datasets";
-import { parseCsv, DEFAULT_CSV_CONFIG } from "../data/csv";
+import { CsvParser, parseCsv, parseCsvFile, DEFAULT_CSV_CONFIG, type FileLike } from "../data/csv";
 import { materializeCsv } from "../data/preprocess";
-import { runLayerCoverage, buildStandaloneBundle, verifyStandalone, loadRuntime } from "../export/standalone";
+import { runLayerCoverage, buildStandaloneBundle, verifyStandalone, loadRuntime, COVERAGE_CASES } from "../export/standalone";
 import { compileExpr } from "../data/expr";
+import { trainBpe, bpeEncode, bpeEncodeWith, bpeDecode, bpeStats, encodeTable } from "../data/bpe";
 import { buildCustom } from "../data/custom";
+import { GENERATORS, generatorShape } from "../data/generators";
+import {
+  DEFAULT_IMAGE_CONFIG,
+  augmentPixels,
+  buildImageDataset,
+  labelFromName,
+  resizePixels,
+  toGrayscale,
+  type ImageRow,
+} from "../data/images";
 import { PRESETS, alignToVocab } from "./presets";
 import { compileLayer, makeLayerDef as mkDef } from "./layers";
 import { CpuOps } from "./gpu/cpu";
@@ -58,6 +69,7 @@ import {
 import { TEXT_CORPUS, TEXT_CHARS, LM_SEQ_LEN } from "../data/corpus";
 import { buildMassiveCorpus, buildWordTokenizer, encodeWordsToIds, decodeTokenIds, tokenizeWords, LM2_SEQ_LEN } from "../data/corpusLarge";
 import { sampleFromProbs } from "./sampling";
+import { tokenizeForModel, detokenize, generateTokens } from "./generate";
 import type { Architecture } from "./types";
 
 export interface TestResult {
@@ -752,6 +764,250 @@ export function runSelfTests(): TestResult[] {
   );
 
   tests.push(
+    run("BPE tokenizer: deterministic, lossless, and it compresses", () => {
+      const model = trainBpe(TEXT_CORPUS, 260);
+      expect(model.merges.length > 100, `only ${model.merges.length} merges learned`);
+      const ids = bpeEncode(TEXT_CORPUS, model.tokens, model.merges);
+      expect(bpeDecode(ids, model.tokens) === TEXT_CORPUS.toLowerCase(), "round trip changed the text");
+      expect(ids.length < TEXT_CORPUS.length * 0.8, `${ids.length} tokens for ${TEXT_CORPUS.length} characters`);
+      const again = trainBpe(TEXT_CORPUS, 260);
+      expect(JSON.stringify(again.merges) === JSON.stringify(model.merges), "training is not deterministic");
+      const stats = bpeStats(model, TEXT_CORPUS);
+      expect(stats.unknown === 0, `${stats.unknown} unknown tokens on the training corpus`);
+      // Whitespace survives as its own tokens, so decoding never invents spaces.
+      const spaced = bpeEncode("hello   there\nagain", model.tokens, model.merges);
+      expect(bpeDecode(spaced, model.tokens) === "hello   there\nagain", `whitespace lost: ${JSON.stringify(bpeDecode(spaced, model.tokens))}`);
+      // An unseen character is the only source of <unk>, and it is visible.
+      const unknown = bpeEncode("caf\u00e9", model.tokens, model.merges);
+      expect(unknown.includes(0), "unseen character should map to <unk>");
+    }),
+  );
+
+  tests.push(
+    run("BPE dataset (tiny_text_bpe) shapes agree with its tokenizer", () => {
+      const ds = generateBuiltin("tiny_text_bpe", { ...DEFAULT_SYNTH, seed: 3 });
+      const tok = ds.meta.tokenizer!;
+      expect(tok.level === "bpe", `level ${tok.level}`);
+      expect((tok.merges?.length ?? 0) > 0, "merge rules not stored with the dataset");
+      expect(ds.meta.outputUnits === tok.tokens.length, `output units ${ds.meta.outputUnits} != vocab ${tok.tokens.length}`);
+      expect(ds.meta.inputShape[0] === tok.seqLen, "context length mismatch");
+      let maxX = -1;
+      let maxY = -1;
+      for (let i = 0; i < ds.train.xs.size; i++) maxX = Math.max(maxX, ds.train.xs.data[i]!);
+      for (let i = 0; i < ds.train.ys.size; i++) maxY = Math.max(maxY, ds.train.ys.data[i]!);
+      expect(maxX < tok.tokens.length && maxY < tok.tokens.length, `token ids outside the vocabulary (x≤${maxX}, y≤${maxY})`);
+      // A training window must decode to real text, not mojibake.
+      const window: number[] = [];
+      for (let i = 0; i < tok.seqLen; i++) window.push(ds.train.xs.data[i]!);
+      const text = bpeDecode(window, tok.tokens);
+      expect(text.length >= tok.seqLen && /[a-z]/.test(text), `window decoded to ${JSON.stringify(text.slice(0, 40))}`);
+      // The tokenizer used for training must be the one stored in the dataset.
+      expect(JSON.stringify(bpeEncode(TEXT_CORPUS.slice(0, 200), tok.tokens, tok.merges!)).length > 2, "stored merge rules do not encode");
+    }),
+  );
+
+  tests.push(
+    run("BPE vocabulary target is honoured and ids stay in range", () => {
+      const small = generateBuiltin("tiny_text_bpe", { ...DEFAULT_SYNTH, seed: 5, bpeVocab: 96 });
+      const big = generateBuiltin("tiny_text_bpe", { ...DEFAULT_SYNTH, seed: 5, bpeVocab: 512 });
+      const tSmall = small.meta.tokenizer!;
+      const tBig = big.meta.tokenizer!;
+      expect(tSmall.tokens.length < tBig.tokens.length, `vocab did not grow: ${tSmall.tokens.length} vs ${tBig.tokens.length}`);
+      expect(tSmall.tokens.length >= 64 && tBig.tokens.length <= 2048, "vocabulary escaped the supported band");
+      expect((tBig.merges?.length ?? 0) === tBig.tokens.length - 2 - 33 - 1 || (tBig.merges?.length ?? 0) > 0, "merge rules missing");
+      for (const ds of [small, big]) {
+        const vocab = ds.meta.tokenizer!.tokens.length;
+        let worst = 0;
+        for (let i = 0; i < ds.train.xs.size; i++) worst = Math.max(worst, ds.train.xs.data[i]!);
+        for (let i = 0; i < ds.train.ys.size; i++) worst = Math.max(worst, ds.train.ys.data[i]!);
+        expect(worst < vocab, `id ${worst} outside a ${vocab}-token vocabulary`);
+        // Neither vocabulary should drop characters the corpus actually uses.
+        const table = encodeTable(ds.meta.tokenizer!.tokens, ds.meta.tokenizer!.merges ?? []);
+        const encoded = bpeEncodeWith(table, TEXT_CORPUS);
+        expect(encoded.filter((id) => id === 0).length === 0, `unknown tokens with vocab ${vocab}`);
+        expect(bpeDecode(encoded, ds.meta.tokenizer!.tokens) === TEXT_CORPUS.toLowerCase(), `round trip broke at vocab ${vocab}`);
+      }
+    }),
+  );
+
+  tests.push(
+    run("synthetic generators produce valid, reproducible datasets", () => {
+      const cfg = { n: 120, noise: 0.08, seed: 13, trainFrac: 0.7, valFrac: 0.15, testFrac: 0.15 };
+      for (const def of GENERATORS) {
+        const values = { ...def.defaults };
+        const ds = def.build({ values, ...cfg });
+        const again = def.build({ values, ...cfg });
+        const shape = generatorShape(def, values);
+        expect(JSON.stringify(ds.meta.inputShape) === JSON.stringify(shape.shape), `${def.id}: shape ${ds.meta.inputShape} != ${shape.shape}`);
+        expect(ds.meta.outputUnits === shape.out, `${def.id}: output units ${ds.meta.outputUnits} != ${shape.out}`);
+        const feat = ds.meta.inputShape.reduce((a, b) => a * b, 1);
+        expect(ds.train.xs.shape[1] === feat || (ds.meta.inputShape.length > 1 && ds.train.xs.shape.length === ds.meta.inputShape.length + 1), `${def.id}: row width ${ds.train.xs.shape} for shape ${ds.meta.inputShape}`);
+        expect(ds.train.xs.size % feat === 0, `${def.id}: ragged features`);
+        expect(ds.train.xs.shape[0]! + ds.val.xs.shape[0]! + ds.test.xs.shape[0]! === cfg.n, `${def.id}: split sizes do not add up`);
+        // Reproducible: same seed, same tensors.
+        expect(JSON.stringify(Array.from(again.train.xs.data)) === JSON.stringify(Array.from(ds.train.xs.data)), `${def.id}: not deterministic`);
+        // Targets agree with the declared task.
+        const yDim = ds.train.ys.size / ds.train.ys.shape[0]!;
+        expect(yDim === ds.meta.outputUnits, `${def.id}: target width ${yDim} != outputUnits ${ds.meta.outputUnits}`);
+        if (ds.meta.task === "multiclass") {
+          for (let i = 0; i < Math.min(20, ds.train.ys.shape[0]!); i++) {
+            let sum = 0;
+            for (let c = 0; c < yDim; c++) sum += ds.train.ys.data[i * yDim + c]!;
+            expect(approx(sum, 1, 1e-5), `${def.id}: row ${i} is not one-hot (sum ${sum})`);
+          }
+          expect(ds.meta.classNames?.length === ds.meta.outputUnits, `${def.id}: class names missing`);
+        }
+        expect(ds.meta.source === "custom", `${def.id}: wrong source`);
+      }
+    }),
+  );
+
+  tests.push(
+    run("image resize, grayscale and augmentation behave", () => {
+      // Nearest-neighbour upsampling of a 2×2 image must map whole quadrants.
+      const quad = new Float32Array([0, 0.25, 0.5, 0.75]);
+      const up = resizePixels(quad, 2, 2, 1, 4, 4, "nearest");
+      // Row 0: [0, 0, 0.25, 0.25]; row 1 the same; rows 2-3 use the second source row.
+      expect(up[0] === 0 && up[1] === 0, `top-left quadrant wrong: ${up[0]}, ${up[1]}`);
+      expect(up[2] === 0.25 && up[3] === 0.25, `top-right quadrant wrong: ${up[2]}, ${up[3]}`);
+      expect(up[8] === 0.5 && up[9] === 0.5, `bottom-left quadrant wrong: ${up[8]}, ${up[9]}`);
+      expect(up[3 * 4 + 3] === 0.75, "bottom-right quadrant wrong");
+      // Bilinear of a constant image stays constant, and midpoints interpolate.
+      const flat = new Float32Array(64).fill(0.4);
+      const resizedFlat = resizePixels(flat, 8, 8, 1, 5, 3, "bilinear");
+      let worst = 0;
+      for (const v of resizedFlat) worst = Math.max(worst, Math.abs(v - 0.4));
+      expect(worst < 1e-6, `constant image changed: ${worst}`);
+      const ramp = new Float32Array([0, 1]);
+      const half = resizePixels(ramp, 2, 1, 1, 3, 1, "bilinear");
+      expect(approx(half[1]!, 0.5, 1e-6), `midpoint should be 0.5, got ${half[1]}`);
+      expect(resizePixels(ramp, 2, 1, 1, 2, 1, "bilinear")[1] === 1, "same-size resize must be exact");
+      // Grayscale uses luma weights: pure green is the brightest primary.
+      const rgb = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+      const gray = toGrayscale(rgb, 3);
+      expect(approx(gray[0]!, 0.299, 1e-6) && approx(gray[1]!, 0.587, 1e-6) && approx(gray[2]!, 0.114, 1e-6), `luma weights wrong: ${Array.from(gray)}`);
+      // Augmentation: flips mirror, 90° rotation is a rotation, everything stays in range.
+      const img = new Float32Array(9).map((_, i) => i / 8);
+      const mirrored = augmentPixels(img, 3, 3, 1, { flipH: true }, new RNG(1));
+      const isMirror = (out: Float32Array): boolean => {
+        for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) if (Math.abs(out[y * 3 + x]! - img[y * 3 + (2 - x)]!) > 1e-6) return false;
+        return true;
+      };
+      const isOriginal = (out: Float32Array): boolean => {
+        for (let i = 0; i < 9; i++) if (Math.abs(out[i]! - img[i]!) > 1e-6) return false;
+        return true;
+      };
+      expect(isMirror(mirrored) || isOriginal(mirrored), "flip augmentation neither flipped nor passed through");
+      const rotated = augmentPixels(img, 3, 3, 1, { rotate90: true }, new RNG(7));
+      const rotatedTwice = augmentPixels(rotated, 3, 3, 1, { rotate90: true }, new RNG(7));
+      expect(JSON.stringify(Array.from(rotated)) === JSON.stringify(Array.from(rotatedTwice)), "90° rotation is not deterministic");
+      const noisy = augmentPixels(img, 3, 3, 1, { brightness: 0.4, contrast: 0.4, noise: 0.2, shift: 1, rotate: 15 }, new RNG(3));
+      for (const v of noisy) expect(v >= 0 && v <= 1, `augmented pixel escaped [0, 1]: ${v}`);
+      // Labels: prefix, folder and single-class modes.
+      expect(labelFromName("cats_001.png", "prefix") === "cats", `prefix label ${labelFromName("cats_001.png", "prefix")}`);
+      expect(labelFromName("dogs-07.jpg", "prefix") === "dogs", "dash separator not handled");
+      expect(labelFromName("a.png", "folder", "vehicles") === "vehicles", "folder label wrong");
+      expect(labelFromName("a.png", "all") === "all", "single-class label wrong");
+    }),
+  );
+
+  tests.push(
+    run("image dataset assembly: augmentation touches the train split only", () => {
+      const rows: ImageRow[] = [];
+      const mk = (label: string, offset: number): ImageRow => ({
+        label,
+        pixels: Float32Array.from({ length: 16 }, (_, i) => ((i + offset) % 7) / 7),
+      });
+      for (let i = 0; i < 10; i++) rows.push(mk(i % 2 === 0 ? "cat" : "dog", i));
+      const cfg = { ...DEFAULT_IMAGE_CONFIG, width: 4, height: 4, channels: 1 as const, copies: 2, rotate: 5, shift: 1, noise: 0.02, seed: 11 };
+      const ds = buildImageDataset(rows, cfg);
+      const nTrain = Math.max(1, Math.floor(rows.length * cfg.trainFrac));
+      expect(ds.train.xs.shape[0] === nTrain * (1 + cfg.copies), `train rows ${ds.train.xs.shape[0]} != ${nTrain * (1 + cfg.copies)}`);
+      expect(ds.val.xs.shape[0] + ds.test.xs.shape[0] === rows.length - nTrain, "val/test sizes changed by augmentation");
+      expect(JSON.stringify(ds.meta.inputShape) === JSON.stringify([4, 4, 1]), `input shape ${ds.meta.inputShape}`);
+      expect(ds.meta.image?.range[0] === 0 && ds.meta.image?.range[1] === 1, "image spec range missing");
+      expect(ds.meta.classNames?.length === 2 && ds.meta.task === "binary", `classes ${ds.meta.classNames} task ${ds.meta.task}`);
+      // Every value is a normalised pixel, original or augmented.
+      for (let i = 0; i < ds.train.xs.size; i++) {
+        const v = ds.train.xs.data[i]!;
+        expect(v >= -1.01 && v <= 1.01, `pixel ${v} outside the normalised range`);
+      }
+      // Augmented copies differ from the clean row (otherwise augmentation did nothing).
+      let changed = 0;
+      for (let i = 0; i < 16; i++) if (Math.abs(ds.train.xs.data[16 + i]! - ds.train.xs.data[i]!) > 1e-6) changed++;
+      expect(changed > 0, "augmented copy is identical to the original");
+      // Single-class mode becomes a reconstruction dataset.
+      const auto = buildImageDataset(rows.map((r) => ({ ...r, label: "all" })), { ...cfg, copies: 0, labelMode: "all" });
+      expect(auto.meta.reconstruction === true && auto.meta.task === "regression", "single class should build an autoencoder dataset");
+      expect(auto.meta.outputUnits === 16, `autoencoder output ${auto.meta.outputUnits}`);
+      // [-1, 1] scaling is applied to the stored tensors.
+      const pm = buildImageDataset(rows, { ...cfg, copies: 0, scale: "pm1" });
+      let sawNegative = false;
+      for (let i = 0; i < pm.train.xs.size; i++) if (pm.train.xs.data[i]! < 0) sawNegative = true;
+      expect(sawNegative, "[-1, 1] scaling did not produce negative values");
+    }),
+  );
+
+  tests.push(
+    run("CSV: streaming parser matches the string parser at every chunk boundary", () => {
+      const text =
+        "\uFEFFname,age,note\r\n" +
+        '"Smith, John",42,"line one\nline two"\r\n' +
+        'plain,7,"he said ""hi"""\n' +
+        "\n" +
+        'trailing,,last\r';
+      const whole = parseCsv(text);
+      expect(whole.headers.length === 3 && whole.rows.length === 3, `parsed ${whole.headers.length} headers / ${whole.rows.length} rows`);
+      expect(whole.rows[0]![0] === "Smith, John", `quoted comma: ${whole.rows[0]![0]}`);
+      expect(whole.rows[0]![2] === "line one\nline two", `embedded newline: ${JSON.stringify(whole.rows[0]![2])}`);
+      expect(whole.rows[1]![2] === 'he said "hi"', `escaped quotes: ${whole.rows[1]![2]}`);
+      for (let cut = 0; cut <= text.length; cut++) {
+        const parser = new CsvParser();
+        parser.push(text.slice(0, cut));
+        parser.push(text.slice(cut));
+        const split = parser.finish();
+        expect(JSON.stringify(split) === JSON.stringify(whole), `chunk boundary ${cut} changed the result`);
+      }
+      // A carriage return that lands at the very end of one chunk is not a row terminator yet.
+      const parser = new CsvParser();
+      parser.push("a,b\r");
+      parser.push("\nc,d\n");
+      const crlf = parser.finish();
+      expect(crlf.rows.length === 1 && crlf.rows[0]![0] === "c", `split CRLF produced ${JSON.stringify(crlf.rows)}`);
+      // Row cap.
+      const capped = parseCsv("h\n" + Array.from({ length: 50 }, (_, i) => String(i)).join("\n"), 10);
+      expect(capped.rows.length === 10, `cap kept ${capped.rows.length} rows`);
+    }),
+  );
+
+  tests.push(
+    run("standalone export: BPE tokenizer + sampled generation parity", () => {
+      const ds = generateBuiltin("tiny_text_bpe", { ...DEFAULT_SYNTH, seed: 2 });
+      const tok = ds.meta.tokenizer!;
+      const model = new SequentialModel(alignToVocab(PRESETS.find((p) => p.id === "bpe-lstm")!.arch, tok.tokens.length, tok.seqLen));
+      const { bundle } = buildStandaloneBundle(model, ds, { name: "bpe-lm", project: "t", loss: "sparse_cce", trained: false });
+      expect(bundle.tokenizer?.level === "bpe", `bundle tokenizer level ${bundle.tokenizer?.level}`);
+      expect((bundle.tokenizer?.merges?.length ?? 0) === (tok.merges?.length ?? 0), "merge rules missing from the bundle");
+      const rt = loadRuntime().createModel(bundle);
+      const texts = ["hello there, how are you today?", "the quick brown fox!", "zyxqv neuronforge 42!", "MiXeD Case  and\nnewlines"];
+      for (const text of texts) {
+        const a = tokenizeForModel(tok, text);
+        const b = rt.tokenize(text);
+        expect(JSON.stringify(a) === JSON.stringify(b), `tokenizer mismatch on ${JSON.stringify(text)}: ${a.length} vs ${b.length}`);
+        expect(detokenize(tok, a) === rt.detokenize(a), `detokenizer mismatch on ${JSON.stringify(text)}`);
+      }
+      const settings = { maxTokens: 24, temperature: 0.7, topK: 20, seed: 5 };
+      const engine = generateTokens(model, tok, "hello there", settings);
+      const runtime = rt.generateDetailed("hello there", settings);
+      expect(JSON.stringify(engine.ids) === JSON.stringify(runtime.ids), "sampled ids differ between the engine and the exported runtime");
+      expect(engine.text === runtime.text, "detokenized generation differs");
+      const report = verifyStandalone(bundle, model, ds);
+      const failed = report.checks.filter((c) => c.status === "fail");
+      expect(report.ok, failed.map((c) => `${c.label}: ${c.detail}`).join(" | "));
+    }),
+  );
+
+  tests.push(
     run("standalone export: CSV preprocessing (categorical + missing) reproduced", () => {
       const csv =
         "age,city,income,label\n25,paris,30000,0\n32,berlin,,1\n47,paris,52000,1\n51,rome,61000,1\n23,berlin,28000,0\n" +
@@ -912,6 +1168,185 @@ export function runSelfTests(): TestResult[] {
   );
 
   tests.push(
+    run("attention: causal mask really hides the future", () => {
+      const layer = compileLayer(
+        mkDef("attention", { id: "a", name: "a", config: { heads: 2, dModel: 4, causal: true, pool: "none" } }),
+        [5, 4],
+        new RNG(3),
+        "xavier_uniform",
+      );
+      const base = new Float32Array(5 * 4);
+      for (let i = 0; i < base.length; i++) base[i] = Math.sin(i * 1.7) * 0.6;
+      const y1 = layer.forward(new Tensor([1, 5, 4], new Float32Array(base)), false);
+      // Change only the last timestep: earlier positions must be untouched.
+      const perturbed = new Float32Array(base);
+      for (let j = 0; j < 4; j++) perturbed[4 * 4 + j] = perturbed[4 * 4 + j]! + 3.5;
+      layer.resetCache();
+      const y2 = layer.forward(new Tensor([1, 5, 4], perturbed), false);
+      let worstPast = 0;
+      for (let i = 0; i < 4 * 4; i++) worstPast = Math.max(worstPast, Math.abs(y1.data[i]! - y2.data[i]!));
+      expect(worstPast < 1e-6, `causal attention leaked the future: worst |Δ| at a past position = ${worstPast}`);
+      let lastChanged = 0;
+      for (let j = 0; j < 4; j++) lastChanged = Math.max(lastChanged, Math.abs(y1.data[16 + j]! - y2.data[16 + j]!));
+      expect(lastChanged > 1e-6, "the final position should react to its own (visible) change");
+
+      const bi = compileLayer(
+        mkDef("attention", { id: "b", name: "b", config: { heads: 2, dModel: 4, causal: false, pool: "none" } }),
+        [5, 4],
+        new RNG(3),
+        "xavier_uniform",
+      );
+      bi.forward(new Tensor([1, 5, 4], new Float32Array(base)), false);
+      const b1 = bi.forward(new Tensor([1, 5, 4], new Float32Array(base)), false);
+      bi.resetCache();
+      const b2 = bi.forward(new Tensor([1, 5, 4], perturbed), false);
+      let changedPast = 0;
+      for (let i = 0; i < 4 * 4; i++) changedPast = Math.max(changedPast, Math.abs(b1.data[i]! - b2.data[i]!));
+      expect(changedPast > 1e-6, "bidirectional attention should let the future influence earlier positions");
+    }),
+  );
+
+  tests.push(
+    run("attention gradients match numerical gradients", () => {
+      const layer = compileLayer(
+        mkDef("attention", { id: "ag", name: "ag", config: { heads: 2, dModel: 4, causal: true, pool: "none" } }),
+        [4, 4],
+        new RNG(21),
+        "xavier_uniform",
+      );
+      const x = new Tensor([2, 4, 4], Float32Array.from([0.2, -0.4, 0.7, 0.1, -0.3, 0.5, 0.15, -0.6, 0.9, 0.35, -0.25, 0.05, 0.45, -0.8, 0.6, 0.3,
+                                                            -0.15, 0.55, 0.25, -0.35, 0.65, 0.1, -0.5, 0.4, 0.3, -0.2, 0.75, 0.05, -0.45, 0.35, 0.2, -0.1]));
+      const dOut = new Tensor([2, 4, 4], Float32Array.from({ length: 32 }, (_, i) => Math.cos(i * 1.3)));
+      const scalar = () => {
+        const y = layer.forward(x, false);
+        let s = 0;
+        for (let i = 0; i < y.size; i++) s += y.data[i]! * dOut.data[i]!;
+        return s;
+      };
+      layer.forward(x, false);
+      layer.backward(dOut);
+      const eps = 1e-3;
+      const checkParam = (name: string, index: number) => {
+        const t = layer.params[name]!;
+        const analytic = layer.grads[name]!.data[index]!;
+        const orig = t.data[index]!;
+        t.data[index] = orig + eps;
+        const lp = scalar();
+        t.data[index] = orig - eps;
+        const lm = scalar();
+        t.data[index] = orig;
+        const numeric = (lp - lm) / (2 * eps);
+        expect(approx(analytic, numeric, 2e-2), `${name}[${index}]: analytic ${analytic} vs numeric ${numeric}`);
+      };
+      checkParam("Wq", 5);
+      checkParam("Wk", 12);
+      checkParam("Wv", 3);
+      checkParam("Wo", 9);
+      checkParam("bq", 2);
+      checkParam("bo", 1);
+    }),
+  );
+
+  tests.push(
+    run("transformer block gradients match numerical gradients", () => {
+      const layer = compileLayer(
+        mkDef("transformer_block", { id: "tg", name: "tg", config: { heads: 2, dModel: 4, ffDim: 6, causal: true, pool: "last", activation: "gelu" } }),
+        [3, 4],
+        new RNG(31),
+        "xavier_uniform",
+      );
+      const x = new Tensor([1, 3, 4], Float32Array.from([0.25, -0.5, 0.75, 0.1, -0.35, 0.45, 0.2, -0.6, 0.8, 0.3, -0.15, 0.05]));
+      const dOut = new Tensor([1, 4], Float32Array.from([0.4, -0.7, 0.2, 0.9]));
+      const scalar = () => {
+        const y = layer.forward(x, false);
+        let s = 0;
+        for (let i = 0; i < y.size; i++) s += y.data[i]! * dOut.data[i]!;
+        return s;
+      };
+      layer.forward(x, false);
+      layer.backward(dOut);
+      const eps = 1e-3;
+      const names = ["Wq", "Wk", "Wv", "Wo", "W1", "W2", "ln1_gamma", "ln1_beta", "ln2_gamma", "ln2_beta", "b1", "b2"];
+      for (const name of names) {
+        const t = layer.params[name]!;
+        const index = Math.min(t.size - 1, 3);
+        const analytic = layer.grads[name]!.data[index]!;
+        const orig = t.data[index]!;
+        t.data[index] = orig + eps;
+        const lp = scalar();
+        t.data[index] = orig - eps;
+        const lm = scalar();
+        t.data[index] = orig;
+        const numeric = (lp - lm) / (2 * eps);
+        expect(approx(analytic, numeric, 3e-2), `${name}[${index}]: analytic ${analytic} vs numeric ${numeric}`);
+      }
+    }),
+  );
+
+  tests.push(
+    run("attention: head count must divide the model width", () => {
+      let threw = false;
+      try {
+        compileLayer(mkDef("attention", { id: "z", name: "z", config: { heads: 5, dModel: 6 } }), [4, 6], new RNG(1), "xavier_uniform");
+      } catch (e) {
+        threw = /divisible/.test(e instanceof Error ? e.message : String(e));
+      }
+      expect(threw, "6-wide attention with 5 heads must be rejected");
+    }),
+  );
+
+  tests.push(
+    run("transformer LM training step lowers the loss", () => {
+      const chars = 6;
+      const seq = 4;
+      const arch: Architecture = {
+        inputShape: [seq],
+        inputName: "tokens",
+        seed: 5,
+        initMethod: "xavier_uniform",
+        layers: [
+          mkDef("embedding", { id: "e", name: "e", config: { vocabSize: chars, embeddingDim: 8 } }),
+          mkDef("transformer_block", { id: "t", name: "t", config: { heads: 2, dModel: 8, ffDim: 16, causal: true, pool: "last", activation: "gelu" } }),
+          mkDef("dense", { id: "d", name: "d", config: { units: chars } }),
+          mkDef("softmax", { id: "s", name: "s" }),
+        ],
+      };
+      const model = new SequentialModel(arch);
+      expect(model.valid, model.issues[0]?.message ?? "invalid");
+      // A toy next-token task: predict the last token of a repeating cycle.
+      const xs: number[][] = [];
+      const ys: number[][] = [];
+      for (let i = 0; i < 24; i++) {
+        const start = i % chars;
+        const row = Array.from({ length: seq }, (_, t) => (start + t) % chars);
+        xs.push(row);
+        ys.push([row[seq - 1]!]);
+      }
+      const X = new Tensor([xs.length, seq], Float32Array.from(xs.flat()));
+      const Y = new Tensor([ys.length, 1], Float32Array.from(ys.flat()));
+      const opt = { ...DEFAULT_OPTIMIZER, name: "adam" as const, learningRate: 0.02 };
+      const state = createOptimizerState();
+      const lossOf = () => computeLoss("sparse_cce", model.forward(X, false).output, Y).value;
+      const before = lossOf();
+      for (let step = 0; step < 8; step++) {
+        const { value, grad } = computeLoss("sparse_cce", model.forward(X, true).output, Y);
+        expect(Number.isFinite(value), `loss became ${value}`);
+        model.backward(grad);
+        optimizerStep(model, opt, state);
+      }
+      const after = lossOf();
+      expect(after < before * 0.9, `loss did not fall: ${before.toFixed(4)} → ${after.toFixed(4)}`);
+    }),
+  );
+
+  tests.push(
+    run("attention: export coverage includes the new layers", () => {
+      const names = COVERAGE_CASES.map((c) => c.name).join(" | ");
+      expect(/Attention/.test(names) && /Transformer block/.test(names), `coverage cases missing attention: ${names.slice(0, 120)}`);
+    }),
+  );
+
+  tests.push(
     run("residual blocks reject impossible shortcuts", () => {
       let threw = false;
       try {
@@ -945,6 +1380,49 @@ export function runSelfTests(): TestResult[] {
 export async function runAsyncSelfTests(): Promise<TestResult[]> {
   const tests: TestResult[] = [];
   const ops = new CpuOps();
+
+  tests.push(
+    await (async () => {
+      const name = "CSV: file streaming reads progress and stops at the cap";
+      const t0 = performance.now();
+      try {
+        const text = "a,b\n" + Array.from({ length: 4000 }, (_, i) => `${i},${i * 2}`).join("\n") + "\n";
+        const bytes = new TextEncoder().encode(text);
+        // Each call gets a fresh stream, so the cap can be tested on the same content.
+        const file: FileLike = {
+          size: bytes.length,
+          stream: () => {
+            let sent = 0;
+            return new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (sent >= bytes.length) {
+                  controller.close();
+                  return;
+                }
+                const chunk = bytes.subarray(sent, sent + 977); // deliberately not a line boundary
+                sent += chunk.length;
+                controller.enqueue(chunk);
+              },
+            });
+          },
+          text: async () => text,
+        };
+        const progress: number[] = [];
+        const parsed = await parseCsvFile(file, { onProgress: (stats) => progress.push(stats.rows) });
+        expect(parsed.headers.length === 2 && !parsed.truncated, `streamed ${parsed.headers.length} headers, truncated=${parsed.truncated}`);
+        expect(parsed.rows.length === 4000, `streamed ${parsed.rows.length} rows`);
+        expect(parsed.rows[3999]![1] === "7998", `last row ${JSON.stringify(parsed.rows[3999])}`);
+        expect(progress.length >= 2 && progress[progress.length - 1] === 4000, `progress callbacks: ${progress.slice(0, 5)}`);
+        // Cap: reading stops early instead of buffering the whole file.
+        const limited = await parseCsvFile(file, { maxRows: 100 });
+        expect(limited.rows.length === 100 && limited.truncated, `cap not honoured: ${limited.rows.length} rows, truncated=${limited.truncated}`);
+        expect(limited.bytes < bytes.length, `cap should stop reading early (read ${limited.bytes} of ${bytes.length} bytes)`);
+        return { name, passed: true, message: `streamed 4,000 rows in 977-byte chunks, cap stopped after ${limited.rows.length} rows`, ms: performance.now() - t0 };
+      } catch (e) {
+        return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
+  );
 
   tests.push(
     await (async () => {
@@ -1010,6 +1488,59 @@ export async function runAsyncSelfTests(): Promise<TestResult[]> {
         acc.destroy();
         expect(worstGrad < 1e-6, `gradients differ by ${worstGrad}`);
         return { name, passed: true, message: `forward and gradients agree (≤ ${Math.max(worstFwd, worstGrad).toExponential(1)})`, ms: performance.now() - t0 };
+      } catch (e) {
+        return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
+  );
+
+  tests.push(
+    await (async () => {
+      const t0 = performance.now();
+      const name = "accelerator: attention layers fall back to the CPU and stay exact";
+      try {
+        const arch: Architecture = {
+          inputShape: [4],
+          inputName: "tokens",
+          seed: 19,
+          initMethod: "xavier_uniform",
+          layers: [
+            makeLayerDef("embedding", { id: "e", name: "e", config: { vocabSize: 5, embeddingDim: 6 } }),
+            makeLayerDef("transformer_block", { id: "t", name: "t", config: { heads: 2, dModel: 6, ffDim: 8, causal: true, pool: "last", activation: "gelu" } }),
+            makeLayerDef("dense", { id: "d", name: "d", config: { units: 5, activation: "softmax" } }),
+          ],
+        };
+        const plain = new SequentialModel(arch);
+        expect(plain.valid, plain.issues[0]?.message ?? "model invalid");
+        const accelerated = new SequentialModel(arch);
+        const acc = new Accelerator(accelerated, ops);
+        const bx = new Tensor([2, 4], Float32Array.from([1, 2, 3, 4, 4, 3, 2, 0]));
+        const dOut = new Tensor([2, 5], [0.2, -0.4, 0.1, 0.05, -0.15, -0.3, 0.6, -0.1, 0.25, 0.05]);
+        const want = plain.forward(bx, false).output;
+        const got = await acc.runForward(bx, false);
+        let worstFwd = 0;
+        for (let i = 0; i < want.size; i++) worstFwd = Math.max(worstFwd, Math.abs(want.data[i]! - got.data[i]!));
+        expect(worstFwd < 1e-6, `forward differs by ${worstFwd}`);
+        plain.zeroGrads();
+        plain.backward(dOut);
+        accelerated.zeroGrads();
+        await acc.runForward(bx, true);
+        await acc.runBackward(dOut);
+        let worstGrad = 0;
+        for (const layer of plain.layers) {
+          const other = accelerated.layers.find((l) => l.def.id === layer.def.id)!;
+          for (const key of Object.keys(layer.grads)) {
+            const a = layer.grads[key]!.data;
+            const b = other.grads[key]!.data;
+            for (let i = 0; i < a.length; i++) worstGrad = Math.max(worstGrad, Math.abs(a[i]! - b[i]!));
+          }
+        }
+        const placements = acc.placements;
+        const cpuLayers = placements.filter((pl) => pl.mode === "cpu").map((pl) => pl.type);
+        acc.destroy();
+        expect(cpuLayers.includes("transformer_block"), `expected the block on the CPU path, placements: ${placements.map((pl) => pl.type + ":" + pl.mode).join(", ")}`);
+        expect(worstGrad < 1e-6, `gradients differ by ${worstGrad}`);
+        return { name, passed: true, message: `forward and gradients agree (≤ ${Math.max(worstFwd, worstGrad).toExponential(1)}); ${cpuLayers.join(", ")} ran on the CPU`, ms: performance.now() - t0 };
       } catch (e) {
         return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
       }

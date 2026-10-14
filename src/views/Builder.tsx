@@ -32,6 +32,8 @@ const LIBRARY: { type: LayerType; group: string }[] = [
   { type: "batchnorm", group: "Normalization" },
   { type: "layernorm", group: "Normalization" },
   { type: "embedding", group: "Sequence" },
+  { type: "attention", group: "Attention" },
+  { type: "transformer_block", group: "Attention" },
   { type: "rnn", group: "Sequence" },
   { type: "lstm", group: "Sequence" },
   { type: "gru", group: "Sequence" },
@@ -47,6 +49,8 @@ const TONE: Record<string, string> = {
   batchnorm: "border-amber-400/40 bg-amber-500/10",
   layernorm: "border-amber-400/40 bg-amber-500/10",
   embedding: "border-indigo-400/40 bg-indigo-500/10",
+  attention: "border-pink-400/40 bg-pink-500/10",
+  transformer_block: "border-pink-400/40 bg-pink-500/10",
   rnn: "border-sky-400/40 bg-sky-500/10",
   lstm: "border-blue-400/40 bg-blue-500/10",
   gru: "border-blue-400/40 bg-blue-500/10",
@@ -434,6 +438,48 @@ function LayerFields({ def, onChange }: { def: { type: LayerType; config: Record
       {"vocabSize" in c && (
         <Field label="Vocab size">
           <Input type="number" min={2} value={Number(c.vocabSize)} onChange={(e) => set("vocabSize", Math.max(2, Number(e.target.value) || 2))} />
+        </Field>
+      )}
+      {"heads" in c && (
+        <Field label="Heads" hint="Independent attention heads. Every head gets its own slice of the model width, so the head count must divide it.">
+          <Input type="number" min={1} value={Number(c.heads)} onChange={(e) => set("heads", Math.max(1, Number(e.target.value) || 1))} />
+        </Field>
+      )}
+      {"dModel" in c && (
+        <Field label="Model width" hint="Width the attention mixes internally. 0 = keep the incoming feature width (an embedding's dim, or the last axis of the input shape). A different value adds a learned input projection.">
+          <Input type="number" min={0} value={Number(c.dModel)} onChange={(e) => set("dModel", Math.max(0, Number(e.target.value) || 0))} />
+        </Field>
+      )}
+      {"ffDim" in c && (
+        <Field label="Feed-forward width" hint="Hidden width of the block's MLP (dModel → ffDim → dModel). 0 = the usual 4 × dModel.">
+          <Input type="number" min={0} value={Number(c.ffDim)} onChange={(e) => set("ffDim", Math.max(0, Number(e.target.value) || 0))} />
+        </Field>
+      )}
+      {"causal" in c && (
+        <Field label="Masking" hint="Causal hides every future position from the current one — required for next-token prediction to be honest. Bidirectional lets every position see the whole sequence.">
+          <Select value={c.causal ? "1" : "0"} onChange={(e) => set("causal", e.target.value === "1")}>
+            <option value="1">causal — no looking ahead</option>
+            <option value="0">bidirectional — full context</option>
+          </Select>
+        </Field>
+      )}
+      {"pool" in c && (
+        <Field label="Output" hint="Sequence keeps [T, dModel] for the next layer. Last hands the final position to a Dense head (GPT-style); mean averages every position.">
+          <Select value={String(c.pool)} onChange={(e) => set("pool", e.target.value)}>
+            <option value="none">sequence [T, dModel]</option>
+            <option value="last">last position</option>
+            <option value="mean">mean of positions</option>
+          </Select>
+        </Field>
+      )}
+      {"dropout" in c && (
+        <Field label="Attention dropout" hint="Applied to the attention probabilities while training, disabled at inference. 0 switches it off.">
+          <Input type="number" min={0} max={0.9} step={0.05} value={Number(c.dropout)} onChange={(e) => set("dropout", Math.min(0.9, Math.max(0, Number(e.target.value))))} />
+        </Field>
+      )}
+      {"scale" in c && (
+        <Field label="Score scale" hint="Multiplies the 1/√d_k normaliser on the attention scores. Below 1 sharpens the distribution, above 1 flattens it — useful for seeing what temperature does to attention.">
+          <Input type="number" min={0.05} step={0.05} value={Number(c.scale)} onChange={(e) => set("scale", Math.max(0.05, Number(e.target.value) || 1))} />
         </Field>
       )}
       {"embeddingDim" in c && (

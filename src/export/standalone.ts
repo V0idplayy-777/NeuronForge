@@ -13,12 +13,12 @@ export { RUNTIME_JS, RUNTIME_PY };
 
 export const STANDALONE_FORMAT = "neuronforge-standalone";
 export const STANDALONE_VERSION = 1;
-export const STANDALONE_RUNTIME_VERSION = "1.1.0";
+export const STANDALONE_RUNTIME_VERSION = "1.3.0";
 
 /** Every layer type the builder can produce. Anything else is reported as unsupported. */
 export const SUPPORTED_LAYER_TYPES: LayerType[] = [
   "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-  "gap2d", "embedding", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+  "gap2d", "embedding", "attention", "transformer_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
   "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 ];
 const FUSABLE = ["none", "linear", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
@@ -498,6 +498,49 @@ export const COVERAGE_CASES: CoverageCase[] = [
     name: "Reshape → LayerNorm → Flatten",
     inputShape: [6],
     layers: [{ type: "dense", config: { units: 6 } }, { type: "reshape", config: { targetShape: [2, 3] } }, { type: "layernorm" }, { type: "flatten" }, { type: "dense", config: { units: 2 } }],
+  },
+  {
+    name: "Attention (2 heads, causal, sequence out)",
+    inputShape: [4, 6],
+    layers: [{ type: "attention", config: { heads: 2, dModel: 6, causal: true, pool: "none" } }],
+  },
+  {
+    name: "Attention (3 heads, bidirectional, pooled last, scale 0.7)",
+    inputShape: [4, 6],
+    layers: [{ type: "attention", config: { heads: 3, dModel: 6, causal: false, pool: "last", scale: 0.7 } }, { type: "dense", config: { units: 3 } }],
+  },
+  {
+    name: "Attention (input projection, pooled mean, no bias)",
+    inputShape: [5, 2],
+    layers: [{ type: "attention", config: { heads: 2, dModel: 8, causal: true, pool: "mean", useBias: false } }, { type: "dense", config: { units: 2 } }],
+  },
+  {
+    name: "Embedding \u2192 Attention (causal, pool last)",
+    inputShape: [4],
+    vocab: 6,
+    layers: [{ type: "embedding", config: { vocabSize: 6, embeddingDim: 8 } }, { type: "attention", config: { heads: 2, dModel: 8, causal: true, pool: "last" } }],
+  },
+  {
+    name: "Transformer block (causal, sequence out)",
+    inputShape: [4, 6],
+    layers: [{ type: "transformer_block", config: { heads: 2, dModel: 6, ffDim: 10, causal: true, pool: "none", activation: "gelu" } }],
+  },
+  {
+    name: "Transformer block (input projection, pool last, relu, no bias)",
+    inputShape: [3, 2],
+    layers: [{ type: "transformer_block", config: { heads: 2, dModel: 8, ffDim: 6, causal: false, pool: "last", activation: "relu", useBias: false } }, { type: "dense", config: { units: 2 } }],
+  },
+  {
+    name: "Embedding \u2192 stacked Transformer blocks \u2192 softmax",
+    inputShape: [4],
+    vocab: 5,
+    layers: [
+      { type: "embedding", config: { vocabSize: 5, embeddingDim: 8 } },
+      { type: "transformer_block", config: { heads: 2, dModel: 8, ffDim: 12, causal: true, pool: "none", activation: "silu" } },
+      { type: "transformer_block", config: { heads: 2, dModel: 8, ffDim: 12, causal: true, pool: "last", activation: "gelu" } },
+      { type: "dense", config: { units: 5 } },
+      { type: "softmax" },
+    ],
   },
   { name: "Embedding (rounding + clamping)", inputShape: [5], vocab: 7, layers: [{ type: "embedding", config: { vocabSize: 7, embeddingDim: 3 } }, { type: "flatten" }, { type: "dense", config: { units: 2 } }] },
   { name: "Embedding → RNN (final state)", inputShape: [4], vocab: 6, layers: [{ type: "embedding", config: { vocabSize: 6, embeddingDim: 3 } }, { type: "rnn", config: { units: 4 } }] },

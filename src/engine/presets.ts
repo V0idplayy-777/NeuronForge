@@ -3,6 +3,7 @@ import { makeLayerDef } from "./layers";
 import { uid } from "./types";
 import type { LayerType } from "./types";
 import { LM_SEQ_LEN, TEXT_VOCAB_SIZE } from "../data/corpus";
+import { BPE_VOCAB_TARGET, BPE2_VOCAB_TARGET } from "../data/datasets";
 import { LM2_SEQ_LEN } from "../data/corpusLarge";
 import { SEQ_WINDOW } from "../data/datasets";
 
@@ -413,6 +414,103 @@ export const PRESETS: Preset[] = [
     ]),
   },
   {
+    id: "char-attention-small",
+    name: "Tiny attention LM (char)",
+    category: "Text",
+    description: `The smallest honest transformer: Embedding → one Multi-Head Attention layer → softmax over the next character. Four heads, 32-dim model width. It has no feed-forward sub-layer and no LayerNorm, so it is a good first look at what attention alone can do — and at what it cannot (it can only mix the embeddings it is given).`,
+    datasetHint: "tiny_text",
+    arch: arch([LM_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: TEXT_VOCAB_SIZE, embeddingDim: 32 } }),
+      makeLayerDef("attention", {
+        name: "attn",
+        config: { heads: 4, dModel: 32, causal: true, useBias: true, dropout: 0, scale: 1, pool: "last" },
+      }),
+      dense(TEXT_VOCAB_SIZE, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
+    id: "char-transformer",
+    name: "Tiny transformer (char LM)",
+    category: "Text",
+    description: `A real (tiny) GPT-style language model over the ${LM_SEQ_LEN}-character context: Embedding → pre-LayerNorm Transformer Block (4-head causal attention + 64-wide GELU feed-forward, with both residual paths) → softmax. Causal masking means position t never sees position t+1, so the next-character prediction is honest. Compare its loss curve against the LSTM and the plain char MLP presets — this is the architecture modern language models are built from, just very small.`,
+    datasetHint: "tiny_text",
+    arch: arch([LM_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: TEXT_VOCAB_SIZE, embeddingDim: 32 } }),
+      makeLayerDef("transformer_block", {
+        name: "block1",
+        config: { heads: 4, dModel: 32, ffDim: 64, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+      }),
+      dense(TEXT_VOCAB_SIZE, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
+    id: "char-transformer-deep",
+    name: "Transformer stack (2 blocks)",
+    category: "Text",
+    description: `Two stacked Transformer Blocks over the whole ${LM_SEQ_LEN}-character context: the first returns its sequence, the second pools the final position. Attention moves information between positions, each block's feed-forward network transforms positions independently, and four residual paths keep the gradient alive through depth. The heavier of the two transformer presets — start with the single-block one.`,
+    datasetHint: "tiny_text",
+    arch: arch([LM_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: TEXT_VOCAB_SIZE, embeddingDim: 32 } }),
+      makeLayerDef("transformer_block", {
+        name: "block1",
+        config: { heads: 4, dModel: 32, ffDim: 64, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+      }),
+      makeLayerDef("transformer_block", {
+        name: "block2",
+        config: { heads: 4, dModel: 32, ffDim: 64, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+      }),
+      dense(TEXT_VOCAB_SIZE, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
+    id: "bpe-lstm",
+    name: "Subword LSTM (BPE)",
+    category: "Text",
+    description: `Embedding → LSTM → softmax over a learned BPE vocabulary instead of raw characters. The tokenizer merges frequent character pairs, so each of the ${LM_SEQ_LEN} context slots carries a whole word fragment — the model sees far more text per step than the character presets, which is why real language models tokenise this way. Selecting the BPE dataset re-aligns the embedding and the output projection to its vocabulary automatically.`,
+    datasetHint: "tiny_text_bpe",
+    arch: arch([LM_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: BPE_VOCAB_TARGET, embeddingDim: 24 } }),
+      makeLayerDef("lstm", { name: "lstm", config: { units: 64, returnSequences: false, forgetBias: 1 } }),
+      dense(BPE_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
+    id: "bpe-transformer",
+    name: "Subword transformer (BPE)",
+    category: "Text",
+    description: `Embedding → pre-LayerNorm Transformer Block (4-head causal attention + GELU feed-forward) → softmax, over a BPE vocabulary of ~${BPE_VOCAB_TARGET} learned subword tokens. This is the modern recipe at educational scale: subword tokens, causal self-attention, residual paths, LayerNorm. Watch the loss against the character transformer preset — the same number of context slots now covers several times more text.`,
+    datasetHint: "tiny_text_bpe",
+    arch: arch([LM_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: BPE_VOCAB_TARGET, embeddingDim: 32 } }),
+      makeLayerDef("transformer_block", {
+        name: "block1",
+        config: { heads: 4, dModel: 32, ffDim: 64, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+      }),
+      dense(BPE_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
+    id: "bpe2-transformer",
+    name: "Subword transformer 2 (large corpus)",
+    category: "Text",
+    description: `The same subword transformer recipe on the massive generated corpus: ~${BPE2_VOCAB_TARGET} BPE tokens, 16 tokens of context. Because BPE never leaves the vocabulary empty-handed, every word in the corpus can be spelled from learned pieces — compare this against the whole-word preset on the same corpus, which has to fall back to <unk> for rare words. Expect slow epochs: this is the biggest text dataset in the app.`,
+    datasetHint: "tiny_text_2_bpe",
+    arch: arch([LM2_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: BPE2_VOCAB_TARGET, embeddingDim: 32 } }),
+      makeLayerDef("transformer_block", {
+        name: "block1",
+        config: { heads: 4, dModel: 32, ffDim: 64, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+      }),
+      dense(BPE2_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
     id: "char-rnn",
     name: "Character RNN language model",
     category: "Text",
@@ -528,6 +626,46 @@ export const PRESETS: Preset[] = [
         makeLayerDef("flatten", { name: "flatten" }),
         dense(24, "h1"),
         act("gelu"),
+        dense(1, "out"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
+    id: "seq-attention",
+    name: "Attention forecaster",
+    category: "Sequence",
+    description: `Multi-head self-attention over the ${SEQ_WINDOW}-step window: a learned input projection lifts the single value per step into a 16-dim model width, two heads attend across every pair of steps (causal masking keeps it honest), the final position's pooled vector goes through a small dense head. This is the transformer alternative to the RNN/LSTM presets on the same data — compare the validation loss, and remember that attention has no built-in notion of order.`,
+    datasetHint: "wave_seq",
+    arch: arch(
+      [SEQ_WINDOW, 1],
+      [
+        makeLayerDef("attention", {
+          name: "attn",
+          config: { heads: 2, dModel: 16, causal: true, useBias: true, dropout: 0, scale: 1, pool: "last" },
+        }),
+        dense(16, "h1"),
+        act("gelu"),
+        dense(1, "out"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
+    id: "seq-transformer",
+    name: "Transformer block forecaster",
+    category: "Sequence",
+    description: `One full Transformer Block — attention plus the feed-forward sub-layer and both residual connections — applied to the ${SEQ_WINDOW}-step window, then a dense head. The block is fed directly from the [T, 1] input: the learned input projection lifts each step to the 16-dim model width, so no separate embedding is needed.`,
+    datasetHint: "wave_seq",
+    arch: arch(
+      [SEQ_WINDOW, 1],
+      [
+        makeLayerDef("transformer_block", {
+          name: "block1",
+          config: { heads: 2, dModel: 16, ffDim: 32, causal: true, useBias: true, dropout: 0, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+        }),
         dense(1, "out"),
       ],
       42,
