@@ -1,6 +1,6 @@
 import type { LossName } from "./types";
 import { Tensor, sliceBatch } from "./tensor";
-import { SequentialModel } from "./model";
+import { SequentialModel, gradNorms } from "./model";
 import { computeLoss } from "./losses";
 import { batchAccuracy } from "./metrics";
 import {
@@ -11,6 +11,7 @@ import {
   type OptimizerState,
 } from "./optimizers";
 import { RNG } from "./rng";
+import type { Accelerator } from "./gpu/executor";
 
 export interface TensorDataset {
   xs: Tensor;
@@ -87,6 +88,12 @@ export type TrainListener = (p: TrainProgress) => void;
 
 export class Trainer {
   status: TrainStatus = "idle";
+  /**
+   * Optional accelerated backend. When present, each training batch runs its
+   * forward and backward passes through the device instead of the CPU engine.
+   * Any device failure drops back to the CPU mid-run rather than losing the run.
+   */
+  accelerator: Accelerator | null = null;
   private pauseGate: Promise<void> | null = null;
   private resumeFn: (() => void) | null = null;
   config: TrainingConfig;
@@ -156,6 +163,41 @@ export class Trainer {
     }
   }
 
+  /** Forward pass of one batch, falling back to the CPU engine if the device fails. */
+  private async forwardBatch(bx: Tensor, epoch: number, batch: number): Promise<{ output: Tensor }> {
+    const accel = this.accelerator;
+    if (!accel) return { output: this.model.forward(bx, true, false).output };
+    try {
+      await accel.syncParams();
+      const output = await accel.runForward(bx, true);
+      return { output };
+    } catch (e) {
+      this.dropAccelerator(e, epoch, batch);
+      return { output: this.model.forward(bx, true, false).output };
+    }
+  }
+
+  /** Backward pass of one batch, falling back to the CPU engine if the device fails. */
+  private async backwardBatch(grad: Tensor): Promise<LayerGradNorm[]> {
+    const accel = this.accelerator;
+    if (!accel) return this.model.backward(grad);
+    try {
+      await accel.runBackward(grad);
+      return gradNorms(this.model);
+    } catch (e) {
+      this.dropAccelerator(e);
+      return this.model.backward(grad);
+    }
+  }
+
+  /** Disables the accelerator for the rest of the run and reports why. */
+  private dropAccelerator(e: unknown, epoch?: number, batch?: number): void {
+    const msg = e instanceof Error ? e.message : String(e);
+    this.accelerator = null;
+    const where = epoch !== undefined ? ` at epoch ${epoch} batch ${batch}` : "";
+    this.emit({ message: `Accelerator disabled${where}: ${msg}. Continuing on the CPU backend.` });
+  }
+
   async run(train: TensorDataset, val?: TensorDataset | null): Promise<TrainProgress> {
     if (!this.model.valid) {
       this.status = "failed";
@@ -204,12 +246,12 @@ export class Trainer {
           const { bx, by } = gather(train, batchIdx);
 
           this.model.zeroGrads();
-          const fwd = this.model.forward(bx, true, false);
+          const fwd = await this.forwardBatch(bx, epoch, b + 1);
           const loss = computeLoss(cfg.loss, fwd.output, by);
           if (!Number.isFinite(loss.value)) {
             throw new Error(`Non-finite loss (${loss.value}) at epoch ${epoch} batch ${b + 1}. Try a lower learning rate or gradient clipping.`);
           }
-          const gradNorms = this.model.backward(loss.grad);
+          const gradNorms = await this.backwardBatch(loss.grad);
           optimizerStep(this.model, cfg.optimizer, this.optState);
 
           const acc = batchAccuracy(fwd.output, by, cfg.loss);
@@ -258,7 +300,9 @@ export class Trainer {
         let valLoss: number | undefined;
         let valAcc: number | undefined;
         if (val && val.xs.size > 0 && (epoch % cfg.validationEvery === 0 || epoch === cfg.epochs)) {
-          const v = evaluateLoss(this.model, val, cfg.loss);
+          const v = this.accelerator
+            ? await evaluateLossAccelerated(val, cfg.loss, this.accelerator)
+            : evaluateLoss(this.model, val, cfg.loss);
           valLoss = v.loss;
           valAcc = v.acc ?? undefined;
           if (valLoss < bestVal) {
@@ -315,6 +359,38 @@ export class Trainer {
       return this.progress;
     }
   }
+}
+
+/**
+ * Same metric as `evaluateLoss`, but batches run through the accelerator when
+ * one is supplied.
+ */
+export async function evaluateLossAccelerated(
+  data: TensorDataset,
+  loss: LossName,
+  accelerator: Accelerator,
+): Promise<{ loss: number; acc: number | null }> {
+  const B = data.xs.shape[0]!;
+  const chunk = Math.min(256, B);
+  let lossAcc = 0;
+  let accAcc = 0;
+  let accN = 0;
+  let n = 0;
+  for (let i = 0; i < B; i += chunk) {
+    const c = Math.min(chunk, B - i);
+    const bx = sliceBatch(data.xs, i, c);
+    const by = sliceBatch(data.ys, i, c);
+    const pred = await accelerator.runForward(bx, false);
+    const L = computeLoss(loss, pred, by);
+    lossAcc += L.value * c;
+    n += c;
+    const acc = batchAccuracy(pred, by, loss);
+    if (acc !== null) {
+      accAcc += acc * c;
+      accN += c;
+    }
+  }
+  return { loss: n ? lossAcc / n : 0, acc: accN ? accAcc / accN : null };
 }
 
 export function evaluateLoss(model: SequentialModel, data: TensorDataset, loss: LossName): { loss: number; acc: number | null } {

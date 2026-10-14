@@ -165,14 +165,25 @@ export function TrainingLab() {
           {!s.model.valid && <p className="text-[11px] text-rose-300 mt-2">{s.model.issues[0]?.message}</p>}
           <p className="text-[10px] text-slate-500 mt-3 leading-relaxed">
             Stop ends the run but keeps the current weights. Reset weights discards learned parameters. Pause preserves optimiser state and continues from the next batch.
-            Identical seeds are not bit-identical across browsers.
+            Identical seeds are not bit-identical across browsers, and a device backend adds its own (small, verified) floating-point
+            ordering differences — the accelerator is checked against the CPU engine before it is used.
           </p>
         </Panel>
         <Panel title="Resources">
           <div className="grid grid-cols-2 gap-2">
             <Stat label="Params" value={fmtInt(s.model.paramCount().trainable)} />
             <Stat label="Est. memory" value={fmtBytes(mem.totalBytes)} />
-            <Stat label="Backend" value="CPU · JS" sub="Cooperative yielding, float32" />
+            <Stat
+              label="Backend"
+              value={s.backendStatus?.kind === "webgpu" && s.backendPlacements ? "WebGPU · WGSL" : "CPU · JS"}
+              sub={
+                s.backendStatus?.kind === "webgpu" && s.backendPlacements
+                  ? `${s.backendPlacements.device} layers on device · ${s.backendPlacements.cpu} on CPU`
+                  : s.webgpuAvailable
+                    ? "float32, cooperative yielding · WebGPU available in Settings"
+                    : "Cooperative yielding, float32"
+              }
+            />
             <Stat label="Dataset" value={s.dataset.meta.name} />
           </div>
         </Panel>

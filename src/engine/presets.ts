@@ -139,6 +139,30 @@ export const PRESETS: Preset[] = [
     ]),
   },
 
+  {
+    id: "residual-mlp",
+    name: "Residual MLP classifier",
+    category: "Classification",
+    description:
+      "A plain Dense layer projects the 2 inputs to 16 units, then four Residual Dense blocks stack on top with identity shortcuts. Each block learns z = x + relu(xW₁)·W₂, so gradients have a direct path to the earlier blocks — the reason very deep stacks stay trainable.",
+    datasetHint: "moons",
+    arch: arch(
+      [2],
+      [
+        dense(16, "stem"),
+        act("relu"),
+        makeLayerDef("residual_dense", { name: "res1", config: { units: 16, activation: "relu" } }),
+        makeLayerDef("residual_dense", { name: "res2", config: { units: 16, activation: "relu" } }),
+        makeLayerDef("residual_dense", { name: "res3", config: { units: 16, activation: "gelu" } }),
+        makeLayerDef("residual_dense", { name: "res4", config: { units: 16, activation: "relu" } }),
+        dense(1, "out"),
+        act("sigmoid"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+
   /* ---------------- Regression ---------------- */
   {
     id: "linreg",
@@ -252,6 +276,24 @@ export const PRESETS: Preset[] = [
       act("leakyrelu", "lrelu1"),
       makeLayerDef("maxpool2d", { name: "pool1", config: { poolSize: 2, stride: 2 } }),
       makeLayerDef("flatten", { name: "flatten" }),
+      dense(4, "logits"),
+      act("softmax"),
+    ]),
+  },
+
+  {
+    id: "resnet-patterns",
+    name: "Residual ConvNet",
+    category: "Vision",
+    description:
+      "The ResNet basic block as a first-class layer: Conv → Residual Conv (identity) → Residual Conv (stride 2, 1×1 projection shortcut) → Residual Conv (identity) → GlobalAvgPool → softmax. The stride-2 block changes channel count and resolution, so its shortcut becomes a learned 1×1 projection instead of the identity.",
+    datasetHint: "patterns",
+    arch: arch([8, 8, 1], [
+      makeLayerDef("conv2d", { name: "stem", config: { filters: 8, kernelSize: 3, stride: 1, padding: "same", useBias: true, activation: "relu" } }),
+      makeLayerDef("residual_conv", { name: "block1", config: { filters: 8, kernelSize: 3, stride: 1, padding: "same", activation: "relu" } }),
+      makeLayerDef("residual_conv", { name: "block2", config: { filters: 16, kernelSize: 3, stride: 2, padding: "same", activation: "relu" } }),
+      makeLayerDef("residual_conv", { name: "block3", config: { filters: 16, kernelSize: 3, stride: 1, padding: "same", activation: "relu" } }),
+      makeLayerDef("gap2d", { name: "gap" }),
       dense(4, "logits"),
       act("softmax"),
     ]),
@@ -396,6 +438,33 @@ export const PRESETS: Preset[] = [
     ]),
   },
 
+  {
+    id: "char-lstm",
+    name: "Character LSTM language model",
+    category: "Text",
+    description: `Embedding → LSTM (full backpropagation through time) → softmax over the ${TEXT_VOCAB_SIZE}-character vocabulary. The input, forget and output gates decide what to write into the cell state and what to read out, so the memory survives far longer contexts than the tanh RNN preset. The forget-gate bias starts at 1, which is what keeps gradients flowing at the start of training.`,
+    datasetHint: "tiny_text",
+    arch: arch([LM_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: TEXT_VOCAB_SIZE, embeddingDim: 16 } }),
+      makeLayerDef("lstm", { name: "lstm", config: { units: 64, returnSequences: false, forgetBias: 1 } }),
+      dense(TEXT_VOCAB_SIZE, "logits"),
+      act("softmax"),
+    ]),
+  },
+  {
+    id: "word-gru",
+    name: "Word GRU (Tiny character LM 2)",
+    category: "Text",
+    description: `Embedding → GRU over ${LM2_SEQ_LEN} word steps → softmax. A GRU has two gates (update and reset) and no separate cell state, so it trains faster per step than the LSTM at similar quality — a good default for the word corpus.`,
+    datasetHint: "tiny_text_2",
+    arch: arch([LM2_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: 3000, embeddingDim: 16 } }),
+      makeLayerDef("gru", { name: "gru", config: { units: 96, returnSequences: false } }),
+      dense(3000, "logits"),
+      act("softmax"),
+    ]),
+  },
+
   /* ---------------- Sequence ---------------- */
   {
     id: "seq-rnn",
@@ -422,6 +491,43 @@ export const PRESETS: Preset[] = [
         makeLayerDef("rnn", { name: "rnn", config: { units: 48, returnSequences: false } }),
         dense(32, "h1"), act("gelu"),
         dense(16, "h2"), act("gelu"),
+        dense(1, "out"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
+    id: "seq-lstm",
+    name: "LSTM sequence forecaster",
+    category: "Sequence",
+    description: `Same task as the RNN forecaster, but with an LSTM cell: three gates plus a cell state that is added to rather than multiplied, which is exactly what long-range numeric dependencies need. Compare validation loss against the RNN preset — on this window length the difference is usually small, which is itself the honest result.`,
+    datasetHint: "wave_seq",
+    arch: arch(
+      [SEQ_WINDOW, 1],
+      [
+        makeLayerDef("lstm", { name: "lstm", config: { units: 32, returnSequences: false, forgetBias: 1 } }),
+        dense(24, "h1"),
+        act("tanh"),
+        dense(1, "out"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
+    id: "seq-gru-all",
+    name: "GRU forecaster (all timesteps)",
+    category: "Sequence",
+    description: `A GRU with returnSequences on: every timestep's hidden state is flattened into the dense head instead of only the last one, so the head can weigh early and late steps differently. More parameters in the head, and a real gradient path through every step.`,
+    datasetHint: "wave_seq",
+    arch: arch(
+      [SEQ_WINDOW, 1],
+      [
+        makeLayerDef("gru", { name: "gru", config: { units: 16, returnSequences: true } }),
+        makeLayerDef("flatten", { name: "flatten" }),
+        dense(24, "h1"),
+        act("gelu"),
         dense(1, "out"),
       ],
       42,

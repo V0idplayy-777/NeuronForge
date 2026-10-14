@@ -27,10 +27,14 @@ const LIBRARY: { type: LayerType; group: string }[] = [
   { type: "maxpool2d", group: "Convolution" },
   { type: "avgpool2d", group: "Convolution" },
   { type: "gap2d", group: "Convolution" },
+  { type: "residual_conv", group: "Residual" },
+  { type: "residual_dense", group: "Residual" },
   { type: "batchnorm", group: "Normalization" },
   { type: "layernorm", group: "Normalization" },
   { type: "embedding", group: "Sequence" },
   { type: "rnn", group: "Sequence" },
+  { type: "lstm", group: "Sequence" },
+  { type: "gru", group: "Sequence" },
 ];
 
 const TONE: Record<string, string> = {
@@ -43,6 +47,11 @@ const TONE: Record<string, string> = {
   batchnorm: "border-amber-400/40 bg-amber-500/10",
   layernorm: "border-amber-400/40 bg-amber-500/10",
   embedding: "border-indigo-400/40 bg-indigo-500/10",
+  rnn: "border-sky-400/40 bg-sky-500/10",
+  lstm: "border-blue-400/40 bg-blue-500/10",
+  gru: "border-blue-400/40 bg-blue-500/10",
+  residual_dense: "border-fuchsia-400/40 bg-fuchsia-500/10",
+  residual_conv: "border-fuchsia-400/40 bg-fuchsia-500/10",
   flatten: "border-slate-400/30 bg-slate-500/10",
   reshape: "border-slate-400/30 bg-slate-500/10",
   identity: "border-slate-400/30 bg-white/5",
@@ -89,7 +98,10 @@ export function Builder() {
             </div>
           ))}
         </div>
-        <div className="mt-4 text-[10px] text-slate-500 leading-relaxed">Click a layer to append it. Sequential graphs only — branches and skip connections are not in this build.</div>
+        <div className="mt-4 text-[10px] text-slate-500 leading-relaxed">
+          Click a layer to append it. Residual Dense / Residual Conv are skip-connection blocks you can drop into a
+          sequential stack; arbitrary branch/graph topologies are still out of scope.
+        </div>
       </Panel>
 
       <div className="flex flex-col min-h-0 gap-3">
@@ -437,6 +449,45 @@ function LayerFields({ def, onChange }: { def: { type: LayerType; config: Record
       {"epsilon" in c && (
         <Field label="Epsilon">
           <Input type="number" step={1e-6} value={Number(c.epsilon)} onChange={(e) => set("epsilon", Number(e.target.value))} />
+        </Field>
+      )}
+      {"returnSequences" in c && (
+        <Field label="Return sequences" hint="Off: only the last timestep reaches the next layer. On: every timestep does (add a Flatten before a Dense layer).">
+          <Select value={c.returnSequences ? "1" : "0"} onChange={(e) => set("returnSequences", e.target.value === "1")}>
+            <option value="0">No — final state only</option>
+            <option value="1">Yes — all timesteps</option>
+          </Select>
+        </Field>
+      )}
+      {"forgetBias" in c && (
+        <Field label="Forget-gate bias" hint="Initial value of the forget gate's bias. 1.0 (default) keeps the cell state alive early in training; 0 makes the cell forget immediately.">
+          <Input type="number" step={0.1} value={Number(c.forgetBias)} onChange={(e) => set("forgetBias", Number(e.target.value))} />
+        </Field>
+      )}
+      {"projection" in c && (
+        <Field label="Shortcut" hint="Identity needs the block to keep its width. Projection adds a learned 1×1 conv / linear layer so the block may change width (and resolution).">
+          <Select value={String(c.projection)} onChange={(e) => set("projection", e.target.value)}>
+            <option value="auto">auto — project only when shapes differ</option>
+            <option value="always">always — always learn the shortcut</option>
+            <option value="never">never — require an identity shortcut</option>
+          </Select>
+        </Field>
+      )}
+      {"scale" in c && (
+        <Field label="Branch scale" hint="Multiplies the residual branch before the add. Values slightly below 1 (e.g. 0.7) keep deep stacks stable.">
+          <Input type="number" step={0.1} value={Number(c.scale)} onChange={(e) => set("scale", Number(e.target.value))} />
+        </Field>
+      )}
+      {"finalActivation" in c && (
+        <Field label="Post-add activation" hint="Applied after the shortcut is added. Standard ResNet blocks leave this as none.">
+          <Select value={String(c.finalActivation)} onChange={(e) => set("finalActivation", e.target.value)}>
+            <option value="none">none</option>
+            {Object.keys(ACTIVATION_DOCS).map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </Select>
         </Field>
       )}
       {"targetShape" in c && (

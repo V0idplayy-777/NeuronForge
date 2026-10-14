@@ -13,12 +13,13 @@
  * floating-point noise (and are usually bit-identical in the same JS engine).
  */
 
-var NF_RUNTIME_VERSION = "1.0.0";
+var NF_RUNTIME_VERSION = "1.1.0";
 var NF_BUNDLE_FORMAT = "neuronforge-standalone";
 var NF_BUNDLE_VERSION = 1;
 var NF_SUPPORTED_LAYERS = [
   "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-  "gap2d", "embedding", "rnn", "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
+  "gap2d", "embedding", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+  "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 ];
 var NF_ACTIVATION_LAYERS = ["relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
 
@@ -208,14 +209,58 @@ function nfInferShape(type, c, s, name) {
     case "embedding":
       if (s.length !== 1) fail("expects [seqLen], got " + nfShapeStr(s));
       return [s[0], nfNum(c.embeddingDim, 8)];
-    case "rnn": {
+    case "rnn":
+    case "lstm":
+    case "gru": {
       if (s.length !== 2) fail("expects [seqLen, features], got " + nfShapeStr(s));
       var u = nfNum(c.units, 32);
       return nfBool(c.returnSequences, false) ? [s[0], u] : [u];
     }
+    case "residual_dense": {
+      if (s.length !== 1) fail("expects rank-1 input, got " + nfShapeStr(s));
+      return [nfResidualWidth(c, s[0])];
+    }
+    case "residual_conv": {
+      var rp = nfResidualConvPlan(c, s, name);
+      return [rp.outH, rp.outW, rp.filters];
+    }
     default:
       throw new Error("Unsupported layer type '" + type + "' in layer '" + name + "'");
   }
+}
+
+function nfSigmoid1(v) {
+  return v >= 0 ? 1 / (1 + Math.exp(-v)) : Math.exp(v) / (1 + Math.exp(v));
+}
+
+function nfResidualWidth(c, din) {
+  var u = Math.round(nfNum(c.units, 0));
+  return u > 0 ? u : din;
+}
+
+function nfResidualConvPlan(c, s, name) {
+  if (s.length !== 3) throw new Error("Layer '" + name + "' (residual_conv): expects [H, W, C], got " + nfShapeStr(s));
+  var H = s[0], W = s[1], Cin = s[2];
+  var k = nfKernel(c.kernelSize);
+  var stride = Math.max(1, Math.round(nfNum(c.stride, 1)));
+  var padding = c.padding === "valid" ? "valid" : "same";
+  var rawF = Math.round(nfNum(c.filters, 0));
+  var filters = rawF > 0 ? rawF : Cin;
+  var g1 = nfConvGeom(H, W, k[0], k[1], stride, padding);
+  var g2 = nfConvGeom(g1.outH, g1.outW, k[0], k[1], 1, padding);
+  if (g2.outH <= 0 || g2.outW <= 0) throw new Error("Layer '" + name + "' (residual_conv): kernels do not fit input " + nfShapeStr(s));
+  var identityShortcut = stride === 1 && filters === Cin && g2.outH === H && g2.outW === W;
+  if (!identityShortcut) {
+    var proj = nfConvGeom(H, W, 1, 1, stride, "valid");
+    if (proj.outH !== g2.outH || proj.outW !== g2.outW) {
+      throw new Error("Layer '" + name + "' (residual_conv): shortcut " + nfShapeStr(s) + " cannot be projected onto the block output " + nfShapeStr([g2.outH, g2.outW, filters]));
+    }
+  }
+  return {
+    H: H, W: W, Cin: Cin, kH: k[0], kW: k[1], stride: stride, padding: padding,
+    filters: filters, outH: g2.outH, outW: g2.outW, identityShortcut: identityShortcut,
+    g1: g1, g2: g2,
+  };
 }
 
 function nfExpectedParams(type, c, s, out) {
@@ -244,6 +289,37 @@ function nfExpectedParams(type, c, s, out) {
     case "rnn": {
       var H = nfNum(c.units, 32);
       return { Wxh: [s[1], H], Whh: [H, H], b: [H] };
+    }
+    case "lstm": {
+      var lh = nfNum(c.units, 32);
+      return { Wx: [s[1], 4 * lh], Wh: [lh, 4 * lh], b: [4 * lh] };
+    }
+    case "gru": {
+      var gh = nfNum(c.units, 32);
+      return {
+        Wxz: [s[1], gh], Wxr: [s[1], gh], Wxn: [s[1], gh],
+        Whz: [gh, gh], Whr: [gh, gh], Whn: [gh, gh],
+        bz: [gh], br: [gh], bn: [gh],
+      };
+    }
+    case "residual_dense": {
+      var rd = { W1: [s[0], nfResidualWidth(c, s[0])], W2: [nfResidualWidth(c, s[0]), nfResidualWidth(c, s[0])] };
+      if (nfBool(c.useBias, true)) {
+        rd.b1 = [nfResidualWidth(c, s[0])];
+        rd.b2 = [nfResidualWidth(c, s[0])];
+      }
+      if (nfResidualWidth(c, s[0]) !== s[0]) rd.Wp = [s[0], nfResidualWidth(c, s[0])];
+      return rd;
+    }
+    case "residual_conv": {
+      var rcp = nfResidualConvPlan(c, s, "residual_conv");
+      var rc = { K1: [rcp.kH, rcp.kW, rcp.Cin, rcp.filters], K2: [rcp.kH, rcp.kW, rcp.filters, rcp.filters] };
+      if (nfBool(c.useBias, true)) {
+        rc.b1 = [rcp.filters];
+        rc.b2 = [rcp.filters];
+      }
+      if (!rcp.identityShortcut) rc.Kp = [1, 1, rcp.Cin, rcp.filters];
+      return rc;
     }
     default:
       return {};
@@ -572,6 +648,143 @@ function nfCompile(def, s, out, P) {
           }
         }
         return { shape: retSeq ? [B, T, RH] : [B, RH], data: o };
+      };
+    }
+    case "lstm": {
+      var LD = s[1];
+      var LH = nfNum(c.units, 32);
+      var LG = 4 * LH;
+      var lstmRetSeq = nfBool(c.returnSequences, false);
+      return function (x) {
+        if (x.shape.length !== 3) throw new Error("LSTM '" + name + "': expected [B, T, " + LD + "], got " + nfShapeStr(x.shape));
+        var B = x.shape[0], T = x.shape[1];
+        var o = lstmRetSeq ? new Float32Array(B * T * LH) : new Float32Array(B * LH);
+        var wx = P.Wx, wh = P.Wh, lbi = P.b, xd = x.data;
+        // Pre = concatenated gate pre-activations for the current step (i, f, g, o).
+        var pre = new Float32Array(LG);
+        var h = new Float32Array(LH);
+        var cstate = new Float32Array(LH);
+        for (var n = 0; n < B; n++) {
+          h.fill(0);
+          cstate.fill(0);
+          for (var t = 0; t < T; t++) {
+            var xOff = (n * T + t) * LD;
+            for (var j = 0; j < LG; j++) {
+              var acc = lbi[j];
+              for (var i = 0; i < LD; i++) acc += xd[xOff + i] * wx[i * LG + j];
+              for (var i2 = 0; i2 < LH; i2++) acc += h[i2] * wh[i2 * LG + j];
+              pre[j] = acc;
+            }
+            for (var u = 0; u < LH; u++) {
+              var ig = nfSigmoid1(pre[u]);
+              var fg = nfSigmoid1(pre[LH + u]);
+              var gg = Math.tanh(pre[2 * LH + u]);
+              var og = nfSigmoid1(pre[3 * LH + u]);
+              cstate[u] = fg * cstate[u] + ig * gg;
+              h[u] = og * Math.tanh(cstate[u]);
+            }
+            if (lstmRetSeq) o.set(h, (n * T + t) * LH);
+          }
+          if (!lstmRetSeq) o.set(h, n * LH);
+        }
+        return { shape: lstmRetSeq ? [B, T, LH] : [B, LH], data: o };
+      };
+    }
+    case "gru": {
+      var GD = s[1];
+      var GH = nfNum(c.units, 32);
+      var gruRetSeq = nfBool(c.returnSequences, false);
+      return function (x) {
+        if (x.shape.length !== 3) throw new Error("GRU '" + name + "': expected [B, T, " + GD + "], got " + nfShapeStr(x.shape));
+        var B = x.shape[0], T = x.shape[1];
+        var o = gruRetSeq ? new Float32Array(B * T * GH) : new Float32Array(B * GH);
+        var xd = x.data;
+        var h = new Float32Array(GH);
+        var z = new Float32Array(GH);
+        var r = new Float32Array(GH);
+        var rn = new Float32Array(GH);
+        var cand = new Float32Array(GH);
+        for (var n = 0; n < B; n++) {
+          h.fill(0);
+          for (var t = 0; t < T; t++) {
+            var xOff = (n * T + t) * GD;
+            for (var u = 0; u < GH; u++) {
+              var az = P.bz[u], ar = P.br[u], an = P.bn[u];
+              for (var i = 0; i < GD; i++) {
+                var xv = xd[xOff + i];
+                az += xv * P.Wxz[i * GH + u];
+                ar += xv * P.Wxr[i * GH + u];
+                an += xv * P.Wxn[i * GH + u];
+              }
+              for (var i2 = 0; i2 < GH; i2++) {
+                az += h[i2] * P.Whz[i2 * GH + u];
+                ar += h[i2] * P.Whr[i2 * GH + u];
+              }
+              z[u] = nfSigmoid1(az);
+              r[u] = nfSigmoid1(ar);
+              rn[u] = r[u] * h[u];
+              cand[u] = an;
+            }
+            for (var v = 0; v < GH; v++) {
+              var at = cand[v];
+              for (var i3 = 0; i3 < GH; i3++) at += rn[i3] * P.Whn[i3 * GH + v];
+              var ng = Math.tanh(at);
+              h[v] = (1 - z[v]) * ng + z[v] * h[v];
+            }
+            if (gruRetSeq) o.set(h, (n * T + t) * GH);
+          }
+          if (!gruRetSeq) o.set(h, n * GH);
+        }
+        return { shape: gruRetSeq ? [B, T, GH] : [B, GH], data: o };
+      };
+    }
+    case "residual_dense": {
+      var rdin = s[0];
+      var rdUnits = nfResidualWidth(c, rdin);
+      var rdBias = nfBool(c.useBias, true);
+      var rdAct = String(c.activation || "relu");
+      var rdAct2 = String(c.finalActivation || "none");
+      var rdScale = nfNum(c.scale, 1);
+      var rdProj = rdUnits !== rdin;
+      return function (x) {
+        if (x.shape.length !== 2 || x.shape[1] !== rdin) throw new Error("Residual Dense '" + name + "': expected [B, " + rdin + "], got " + nfShapeStr(x.shape));
+        var B = x.shape[0];
+        var h = nfMatmul(x.data, B, rdin, P.W1, rdUnits);
+        if (rdBias) h = nfAddBias(h, B, rdUnits, P.b1);
+        if (rdAct !== "none" && rdAct !== "linear") h = nfActivation(rdAct, h, rdUnits, 0.01);
+        var main = nfMatmul(h, B, rdUnits, P.W2, rdUnits);
+        if (rdBias) main = nfAddBias(main, B, rdUnits, P.b2);
+        var y = new Float32Array(main.length);
+        var skip = rdProj ? nfMatmul(x.data, B, rdin, P.Wp, rdUnits) : x.data;
+        for (var i = 0; i < y.length; i++) y[i] = skip[i] + rdScale * main[i];
+        if (rdAct2 !== "none" && rdAct2 !== "linear") y = nfActivation(rdAct2, y, rdUnits, 0.01);
+        return { shape: [B, rdUnits], data: y };
+      };
+    }
+    case "residual_conv": {
+      var rcp = nfResidualConvPlan(c, s, name);
+      var rBias = nfBool(c.useBias, true);
+      var rAct = String(c.activation || "relu");
+      var rAct2 = String(c.finalActivation || "none");
+      var rScale = nfNum(c.scale, 1);
+      var rp1 = Math.floor(rcp.g1.padH / 2), rp1l = Math.floor(rcp.g1.padW / 2);
+      var rp2 = Math.floor(rcp.g2.padH / 2), rp2l = Math.floor(rcp.g2.padW / 2);
+      return function (x) {
+        var B = x.shape[0];
+        var h = nfConv2d(x.data, P.K1, rBias ? P.b1 : null, B, rcp.H, rcp.W, rcp.Cin, rcp.g1.outH, rcp.g1.outW, rcp.filters, rcp.kH, rcp.kW, rcp.stride, rp1, rp1l);
+        if (rAct !== "none" && rAct !== "linear") h = nfActivation(rAct, h, rcp.filters, 0.01);
+        var main = nfConv2d(h, P.K2, rBias ? P.b2 : null, B, rcp.g1.outH, rcp.g1.outW, rcp.filters, rcp.outH, rcp.outW, rcp.filters, rcp.kH, rcp.kW, 1, rp2, rp2l);
+        var skip;
+        if (rcp.identityShortcut) {
+          skip = x.data;
+        } else {
+          var projOut = nfConvGeom(rcp.H, rcp.W, 1, 1, rcp.stride, "valid");
+          skip = nfConv2d(x.data, P.Kp, null, B, rcp.H, rcp.W, rcp.Cin, projOut.outH, projOut.outW, rcp.filters, 1, 1, rcp.stride, 0, 0);
+        }
+        var y = new Float32Array(main.length);
+        for (var i = 0; i < y.length; i++) y[i] = skip[i] + rScale * main[i];
+        if (rAct2 !== "none" && rAct2 !== "linear") y = nfActivation(rAct2, y, rcp.filters, 0.01);
+        return { shape: [B, rcp.outH, rcp.outW, rcp.filters], data: y };
       };
     }
     default:

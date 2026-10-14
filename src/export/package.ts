@@ -358,7 +358,7 @@ export function jsPackageFiles(b: StandaloneBundle, pkg: string): FileMap {
     "package.json": JSON.stringify(
       {
         name: pkg,
-        version: "1.0.0",
+        version: "1.1.0",
         description: `${b.name}: NeuronForge standalone model (${b.task})`,
         type: "module",
         main: "model.mjs",
