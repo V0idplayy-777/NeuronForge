@@ -511,6 +511,121 @@ export const PRESETS: Preset[] = [
     ]),
   },
   {
+    id: "gpt2-char",
+    name: "GPT-2 style (char) - 4 layers",
+    category: "Text",
+    description: `A 4-layer GPT-2-style decoder on characters: 64-dim embedding → 4× pre-LayerNorm Transformer Blocks (4-head causal attention, 256-wide GELU feed-forward, residual paths, 10% dropout) → softmax over the ${TEXT_VOCAB_SIZE}-char vocabulary. GPT-2 small is 12 layers × 768 width × 12 heads × 3072 FF; this is the same recipe at 1/12 scale. With ${LM_SEQ_LEN} characters of context it can learn words, short phrases and sentence boundaries. Train 15+ epochs, then sample with temperature 0.8 for diverse completions. A good stepping stone before the BPE GPT-2 presets.`,
+    datasetHint: "tiny_text",
+    arch: arch(
+      [LM_SEQ_LEN],
+      [
+        makeLayerDef("embedding", { name: "embed", config: { vocabSize: TEXT_VOCAB_SIZE, embeddingDim: 64 } }),
+        makeLayerDef("transformer_block", {
+          name: "block1",
+          config: { heads: 4, dModel: 64, ffDim: 256, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block2",
+          config: { heads: 4, dModel: 64, ffDim: 256, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block3",
+          config: { heads: 4, dModel: 64, ffDim: 256, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block4",
+          config: { heads: 4, dModel: 64, ffDim: 256, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+        }),
+        dense(TEXT_VOCAB_SIZE, "logits"),
+        act("softmax"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
+    id: "gpt2-bpe",
+    name: "GPT-2 style (BPE) - 6 layers",
+    category: "Text",
+    description: `A faithful GPT-2-style decoder at educational scale: 128-dim embedding over ~${BPE_VOCAB_TARGET} BPE subwords → 6× pre-LayerNorm Transformer Blocks (8-head causal self-attention, 512-wide GELU feed-forward, residual shortcuts, 10% attention dropout) → softmax. This mirrors GPT-2 small (12 layers × 768 width × 12 heads × 3072 FF) at ~1/6 scale — same causal masking, same pre-LN ordering, same GELU. With BPE, ${LM_SEQ_LEN} context tokens cover several sentences, so the model learns phrase-level syntax and can generate coherent paragraphs. Train 20+ epochs, then sample with temperature 0.8 and top-k 40 for GPT-2-like diverse, on-topic completions. The most capable text preset in the app — slower per epoch, but the samples are worth it.`,
+    datasetHint: "tiny_text_bpe",
+    arch: arch(
+      [LM_SEQ_LEN],
+      [
+        makeLayerDef("embedding", { name: "embed", config: { vocabSize: BPE_VOCAB_TARGET, embeddingDim: 128 } }),
+        makeLayerDef("transformer_block", {
+          name: "block1",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block2",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block3",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block4",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block5",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block6",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+        }),
+        dense(BPE_VOCAB_TARGET, "logits"),
+        act("softmax"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
+    id: "gpt2-bpe-large",
+    name: "GPT-2 style XL (large corpus)",
+    category: "Text",
+    description: `Same 6-layer GPT-2 recipe on the massive generated corpus: ~${BPE2_VOCAB_TARGET} BPE tokens, ${LM2_SEQ_LEN} tokens of context, but the corpus spans greetings, dialogue, narrative, science, computing, history, food, music, sport, health and nature — over 14k templated sentences plus hand-written banks. Because BPE is closed, every word can be spelled from learned pieces (no <unk>). The 128-dim, 8-head, 512-FF stack has ~1.3M parameters and needs many epochs to shine; start with batch 32 and 3 epochs to see it move, then scale to 20+ epochs. Sampling with temperature 0.8 / top-k 40 yields the most open-ended, GPT-2-like responses in the app. Expect slow epochs — this is the biggest model + biggest dataset combo.`,
+    datasetHint: "tiny_text_2_bpe",
+    arch: arch(
+      [LM2_SEQ_LEN],
+      [
+        makeLayerDef("embedding", { name: "embed", config: { vocabSize: BPE2_VOCAB_TARGET, embeddingDim: 128 } }),
+        makeLayerDef("transformer_block", {
+          name: "block1",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block2",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block3",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block4",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block5",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "none", activation: "gelu", epsilon: 1e-5 },
+        }),
+        makeLayerDef("transformer_block", {
+          name: "block6",
+          config: { heads: 8, dModel: 128, ffDim: 512, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: "last", activation: "gelu", epsilon: 1e-5 },
+        }),
+        dense(BPE2_VOCAB_TARGET, "logits"),
+        act("softmax"),
+      ],
+      42,
+      "xavier_normal",
+    ),
+  },
+  {
     id: "char-rnn",
     name: "Character RNN language model",
     category: "Text",
