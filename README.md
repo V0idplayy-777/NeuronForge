@@ -10,7 +10,7 @@ Browser-based neural network laboratory. Models, gradients, losses, and metrics 
 - Optimisers: SGD, momentum, Adam, AdamW
 - Losses: MSE, MAE, BCE, categorical CE, sparse CE
 - IndexedDB project persistence (localStorage fallback)
-- Cooperative training loop (`setTimeout(0)` between batches) so the UI stays responsive
+- Cooperative training loop (`setTimeout(0)` between batches) so the UI stays responsive; gradient-norm diagnostics are reduced every 10 steps by default (and at epoch boundaries), avoiding an extra full parameter-memory scan every update without changing gradients or optimizer results
 - Optional WebGPU (WGSL) compute backend, verified against the CPU engine before use; the CPU path is the default and the only requirement
 
 ## Development
@@ -82,6 +82,8 @@ Weight checksums include the layer key, so a tensor moved onto the wrong layer i
 
 ## Language models
 
+NeuronForge is a from-scratch educational trainer, not a pretrained assistant service. It can train next-token models and demonstrate how capacity, tokenisation, and optimisation affect loss, but the bundled corpus is small and partly generated. Models trained here should **not** be expected to answer arbitrary questions, maintain reliable multi-turn conversations, or match a production language model. Useful general-purpose assistant quality requires substantially larger, curated instruction/conversation data and compute than a browser tab can provide.
+
 Four text datasets ship with the app, covering all three tokenizer levels — one token per character, one token per word, and learned subword merges:
 
 | | Tiny character LM | Tiny character LM 2 | Tiny BPE LM | Tiny BPE LM 2 |
@@ -97,6 +99,8 @@ The BPE tokenizer (`src/data/bpe.ts`) **learns** its merges from the corpus at l
 The large corpus (`src/data/corpusLarge.ts`) is generated deterministically at runtime from hand-written banks (greetings, Q&A dialogue, narrative, science, computing, advice, history, food, music, sport, health, nature) plus 30 combinatorial sentence templates, then shuffled so topics are interleaved. The Dataset Studio reports its exact size: characters, sentences, word tokens, unique word types, and what fraction of tokens fell outside the vocabulary cap.
 
 **Vocabulary capping is deliberate and reported.** An uncapped word vocabulary makes the output projection enormous; the cap maps rare words to a real `<unk>` token that the model *does* see during training, so inference on unseen words is principled rather than silently wrong. The OOV rate is displayed.
+
+Two additional large-corpus presets are available in **Model Builder → Load preset → Text**: **Forge Text Large** (4 causal transformer blocks, width 64) and **Forge Text XL** (6 blocks, width 128). They use the large-corpus BPE tokenizer and train from scratch; XL has million-plus parameters. Preset loading selects a conservative, hardware-aware starter batch and caps the initial run at three epochs so users can verify that their device stays responsive before scaling up. In Training Lab, the **Fit batch** recommendation estimates a conservative memory budget and lowers the batch size when needed. It preserves model capacity and weights, though smaller batches do change gradient noise. Browser RAM availability is not exposed reliably, so the estimate is advisory—not a promise that a model will fit.
 
 ## Sampling
 
@@ -124,7 +128,7 @@ Six sequence-capable architectures are available: character MLPs (flattened cont
 
 ## Presets
 
-46 presets in six categories (Classification, Regression, Vision, Autoencoder, Text, **Sequence**), from logistic-regression baselines to two-block CNNs, character-level language models, gated-cell language models and RNN/LSTM/GRU sequence forecasters. They include residual MLP and ResNet-pattern presets that stack residual blocks, char/word/subword language models built on LSTM and GRU cells, and attention presets: a causal self-attention LM, transformer language models over both the character and subword vocabularies, and an attention forecaster for the sequence dataset. Loading a preset also selects its matching dataset and recommended loss, so every preset trains immediately. Autoencoder presets automatically build a reconstruction dataset (targets = inputs).
+51 presets in six categories (Classification, Regression, Vision, Autoencoder, Text, **Sequence**), from logistic-regression baselines to two-block CNNs, character-level language models, gated-cell language models and RNN/LSTM/GRU sequence forecasters. They include residual MLP and ResNet-pattern presets that stack residual blocks, char/word/subword language models built on LSTM and GRU cells, and attention presets: a causal self-attention LM, transformer language models over both the character and subword vocabularies, and an attention forecaster for the sequence dataset. Loading a preset also selects its matching dataset and recommended loss, so every preset trains immediately. Autoencoder presets automatically build a reconstruction dataset (targets = inputs).
 
 **Sequence** is a new, non-text category built around the **Wave sequence forecasting** dataset (`wave_seq`): each example is a 12-step window of a noisy two-frequency wave, and the target is the value immediately after it. It includes a baseline RNN forecaster, a deeper RNN forecaster, and a no-recurrence MLP baseline on the identical windows — so you can directly check whether recurrence is earning its complexity on a given task.
 

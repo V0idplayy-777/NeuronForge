@@ -419,11 +419,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
       }
       pushArch(archToLoad, false);
-      // Word-level models have a large output projection, so default to a
-      // realistic batch size and a short first run rather than the global defaults.
-      if (pr.datasetHint === "tiny_text_2") {
-        setTrainingConfig({ batchSize: 32, epochs: Math.min(projectRef.current.trainingConfig.epochs, 3) });
-        note += " Defaults set to batch 32, 3 epochs — this dataset is far larger than the toy sets.";
+      // Text models can have large optimizer state and attention workspaces.
+      // Start with a bounded, device-sensitive batch and short smoke-test run;
+      // users can increase epochs after confirming the run fits their device.
+      if (pr.category === "Text") {
+        const parameterCount = new SequentialModel(archToLoad).paramCount().trainable;
+        const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+        const cores = navigator.hardwareConcurrency || 4;
+        const lowMemory = (deviceMemory !== undefined && deviceMemory <= 4) || cores <= 4;
+        const batchSize = parameterCount >= 800_000 ? (lowMemory ? 1 : 2) : parameterCount >= 250_000 ? (lowMemory ? 2 : 4) : 8;
+        const epochs = Math.min(projectRef.current.trainingConfig.epochs, parameterCount >= 250_000 ? 3 : 5);
+        setTrainingConfig({ batchSize, epochs });
+        note += ` Safe starter run set to batch ${batchSize}, ${epochs} epochs for this ${parameterCount.toLocaleString()}-parameter text model; raise these gradually if your device has room.`;
       }
       log("info", note);
       setView("builder");
