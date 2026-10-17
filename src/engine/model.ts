@@ -94,14 +94,38 @@ export class SequentialModel {
     const paramBytes = (pc.trainable + pc.nonTrainable) * 4;
     const optMul = optimizer === "sgd" ? 0 : optimizer === "momentum" ? 1 : 2;
     const optimizerBytes = pc.trainable * 4 * optMul;
-    let act = 0;
-    let shape = this.arch.inputShape;
-    act += numel(shape) * batchSize * 4;
+    // The forward outputs alone are not a useful training-memory estimate:
+    // backprop retains intermediate activations, and attention additionally
+    // materialises per-head T×T score/probability tensors. Use a conservative
+    // multiplier plus explicit sequence-layer workspaces so small-device users
+    // get warned before starting, rather than after the tab is killed.
+    let activationFloats = numel(this.arch.inputShape) * batchSize * 3;
+    let shape = this.arch.inputShape.slice();
     for (const l of this.layers) {
+      const config = l.def.config;
+      const type = l.def.type;
+      const outputFloats = numel(l.outputShape) * batchSize;
+      activationFloats += outputFloats * 3;
+
+      if (type === "attention" || type === "transformer_block") {
+        const sequenceLength = shape.length >= 2 ? shape[shape.length - 2]! : 1;
+        const heads = Math.max(1, Number(config.heads) || 1);
+        // Scores, probabilities and their backward workspace; a practical
+        // conservative allowance for the CPU implementation's temporary arrays.
+        activationFloats += batchSize * heads * sequenceLength * sequenceLength * 3;
+        const width = Math.max(1, Number(config.dModel) || shape[shape.length - 1] || 1);
+        const ff = type === "transformer_block" ? Math.max(width, Number(config.ffDim) || width * 2) : 0;
+        activationFloats += batchSize * sequenceLength * (width * 5 + ff * 2);
+      } else if (type === "rnn" || type === "gru" || type === "lstm") {
+        const sequenceLength = shape.length >= 2 ? shape[shape.length - 2]! : 1;
+        const units = Math.max(1, Number(config.units) || 1);
+        const gates = type === "lstm" ? 6 : type === "gru" ? 5 : 2;
+        activationFloats += batchSize * sequenceLength * units * gates;
+      }
       shape = l.outputShape;
-      act += numel(shape) * batchSize * 4;
     }
-    return { paramBytes, optimizerBytes, activationBytes: act, totalBytes: paramBytes + optimizerBytes + act };
+    const activationBytes = activationFloats * 4;
+    return { paramBytes, optimizerBytes, activationBytes, totalBytes: paramBytes + optimizerBytes + activationBytes };
   }
 
   forward(x: Tensor, training: boolean, collect = false): ForwardResult {
@@ -120,19 +144,24 @@ export class SequentialModel {
     return { output: h, activations };
   }
 
-  backward(dOut: Tensor): { id: string; name: string; gradNorm: number }[] {
+  backward(dOut: Tensor, collectGradNorms = true): { id: string; name: string; gradNorm: number }[] {
     let g = dOut;
     const norms: { id: string; name: string; gradNorm: number }[] = [];
     for (let i = this.layers.length - 1; i >= 0; i--) {
       const layer = this.layers[i]!;
       g = layer.backward(g);
-      let acc = 0;
-      for (const t of Object.values(layer.grads)) {
-        for (let k = 0; k < t.size; k++) acc += t.data[k]! * t.data[k]!;
+      // Reducing every parameter gradient to a norm is a full extra memory
+      // pass. Large models only need this diagnostic periodically; skipping it
+      // does not skip or alter any gradient computation or optimizer update.
+      if (collectGradNorms) {
+        let acc = 0;
+        for (const t of Object.values(layer.grads)) {
+          for (let k = 0; k < t.size; k++) acc += t.data[k]! * t.data[k]!;
+        }
+        norms.push({ id: layer.def.id, name: layer.def.name, gradNorm: Math.sqrt(acc) });
       }
-      norms.push({ id: layer.def.id, name: layer.def.name, gradNorm: Math.sqrt(acc) });
     }
-    return norms.reverse();
+    return collectGradNorms ? norms.reverse() : [];
   }
 
   trainableParams(): { layer: CompiledLayer; name: string; data: Tensor; grad: Tensor }[] {

@@ -11,6 +11,9 @@ const __dirname = path.dirname(__filename);
 
 export default defineConfig({
   base: "./",
+  // Arena serves previews through a generated proxy hostname. Accept that host
+  // in development so the browser preview is reachable outside this sandbox.
+  server: { allowedHosts: true },
   plugins: [react(), tailwindcss(), viteSingleFile()],
   resolve: {
     alias: {

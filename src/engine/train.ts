@@ -39,7 +39,7 @@ export const DEFAULT_TRAINING: TrainingConfig = {
   optimizer: { ...DEFAULT_OPTIMIZER },
   validationEvery: 1,
   earlyStoppingPatience: 0,
-  collectDiagnosticsEvery: 1,
+  collectDiagnosticsEvery: 10,
 };
 
 export type TrainStatus = "idle" | "running" | "paused" | "stopping" | "completed" | "failed";
@@ -178,15 +178,15 @@ export class Trainer {
   }
 
   /** Backward pass of one batch, falling back to the CPU engine if the device fails. */
-  private async backwardBatch(grad: Tensor): Promise<LayerGradNorm[]> {
+  private async backwardBatch(grad: Tensor, collectDiagnostics: boolean): Promise<LayerGradNorm[]> {
     const accel = this.accelerator;
-    if (!accel) return this.model.backward(grad);
+    if (!accel) return this.model.backward(grad, collectDiagnostics);
     try {
       await accel.runBackward(grad);
-      return gradNorms(this.model);
+      return collectDiagnostics ? gradNorms(this.model) : [];
     } catch (e) {
       this.dropAccelerator(e);
-      return this.model.backward(grad);
+      return this.model.backward(grad, collectDiagnostics);
     }
   }
 
@@ -225,6 +225,7 @@ export class Trainer {
     let epochTrainLoss = 0;
     let epochTrainAccAcc = 0;
     let epochTrainAccN = 0;
+    let latestGradNorms: LayerGradNorm[] = [];
     let step = this.progress.step;
 
     try {
@@ -251,7 +252,10 @@ export class Trainer {
           if (!Number.isFinite(loss.value)) {
             throw new Error(`Non-finite loss (${loss.value}) at epoch ${epoch} batch ${b + 1}. Try a lower learning rate or gradient clipping.`);
           }
-          const gradNorms = await this.backwardBatch(loss.grad);
+          const diagnosticsEvery = Math.max(1, cfg.collectDiagnosticsEvery || 1);
+          const collectDiagnostics = (step + 1) % diagnosticsEvery === 0 || b === batches - 1;
+          const gradNorms = await this.backwardBatch(loss.grad, collectDiagnostics);
+          if (gradNorms.length) latestGradNorms = gradNorms;
           optimizerStep(this.model, cfg.optimizer, this.optState);
 
           const acc = batchAccuracy(fwd.output, by, cfg.loss);
@@ -284,7 +288,7 @@ export class Trainer {
             etaMs: eta,
             samplesSeen,
             samplesPerSec: sps,
-            gradNorms,
+            gradNorms: latestGradNorms,
           };
 
           if (b === batches - 1 || b % 2 === 0) {

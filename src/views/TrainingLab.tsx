@@ -6,6 +6,18 @@ import { OPTIMIZER_DOCS } from "../engine/optimizers";
 import { fmt, fmtDuration, fmtInt, fmtBytes } from "../lib/format";
 import type { LossName, OptimizerName } from "../engine/types";
 
+/** A deliberately conservative advisory budget; browsers do not expose exact free RAM. */
+function deviceMemoryBudget(): { bytes: number; note: string } {
+  const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+  const cores = navigator.hardwareConcurrency || 4;
+  if (deviceMemory !== undefined) {
+    const bytes = Math.max(96, Math.min(512, deviceMemory * 64)) * 1024 * 1024;
+    return { bytes, note: `approx. ${Math.round(deviceMemory)} GB device` };
+  }
+  const bytes = (cores <= 4 ? 128 : 256) * 1024 * 1024;
+  return { bytes, note: `fallback estimate · ${cores} logical cores` };
+}
+
 export function TrainingLab() {
   const s = useStore();
   const p = s.progress;
@@ -14,6 +26,12 @@ export function TrainingLab() {
   const cfg = s.trainingConfig;
   const mem = s.model.memoryEstimate(cfg.batchSize, cfg.optimizer.name);
   const cls = cfg.loss !== "mse" && cfg.loss !== "mae";
+  const memoryBudget = deviceMemoryBudget();
+  let fitBatchSize = cfg.batchSize;
+  while (fitBatchSize > 1 && s.model.memoryEstimate(fitBatchSize, cfg.optimizer.name).totalBytes > memoryBudget.bytes) {
+    fitBatchSize = Math.max(1, Math.floor(fitBatchSize / 2));
+  }
+  const estimatedForFit = s.model.memoryEstimate(fitBatchSize, cfg.optimizer.name).totalBytes;
 
   const series = [
     { name: "train loss", color: "#22d3ee", values: p.history.map((h) => ({ x: h.epoch, y: h.trainLoss })) },
@@ -185,6 +203,23 @@ export function TrainingLab() {
               }
             />
             <Stat label="Dataset" value={s.dataset.meta.name} />
+          </div>
+          <div className="mt-3 rounded-md border border-white/8 bg-black/20 p-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-slate-300">Conservative memory budget: {fmtBytes(memoryBudget.bytes)}</span>
+              {fitBatchSize < cfg.batchSize && !running && !paused && (
+                <Button size="sm" variant="ghost" onClick={() => s.setTrainingConfig({ batchSize: fitBatchSize })}>
+                  Fit batch · {fitBatchSize}
+                </Button>
+              )}
+            </div>
+            <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+              {memoryBudget.note}. Current estimate: {fmtBytes(mem.totalBytes)}; at batch {fitBatchSize}: {fmtBytes(estimatedForFit)}.
+              This is a conservative advisory, not a guarantee—browser memory availability varies. A smaller batch keeps the same model and weights but changes gradient noise; it does not shrink model capacity.
+            </p>
+            {fitBatchSize === 1 && estimatedForFit > memoryBudget.bytes && (
+              <p className="text-[10px] text-amber-300 mt-1">Even batch 1 exceeds this estimate. Choose a smaller Text preset or reduce its width/depth in Model Builder.</p>
+            )}
           </div>
         </Panel>
       </div>
