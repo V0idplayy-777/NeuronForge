@@ -217,6 +217,9 @@ export class Accelerator {
   /* ---------------------------------------------------------------- forward */
 
   async runForward(x: Tensor, training: boolean): Promise<Tensor> {
+    // A new forward invalidates the previous forward cache. Inference and
+    // validation have no backward pass to release their temporary buffers.
+    this.releaseScratch();
     this.active = true;
     // The first call after construction (or after a model rebuild) uploads the
     // parameters; training loops call syncParams() per batch to refresh them.

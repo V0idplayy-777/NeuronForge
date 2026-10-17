@@ -52,7 +52,7 @@ export interface PoolGeom {
 }
 
 export interface DeviceInfo {
-  kind: "webgpu" | "cpu";
+  kind: "webgpu" | "cpu" | "tensorflow";
   label: string;
   adapter?: string;
   maxBufferBytes?: number;

@@ -319,6 +319,30 @@ function buildCases(): DeviceCase[] {
   return cases;
 }
 
+/** Track every allocation made by a test, including inputs and intermediates.
+ * Disposing only the final output leaks real device tensors on repeated checks.
+ */
+function trackedDevice(device: GpuOps): { ops: GpuOps; cleanup: () => void } {
+  const buffers = new Set<DevBuffer>();
+  const ops = new Proxy(device, {
+    get(target, key) {
+      const value = Reflect.get(target, key);
+      if (typeof value !== "function") return value;
+      return async (...args: unknown[]) => {
+        const result: unknown = await Reflect.apply(value, target, args);
+        if (result && typeof result === "object" && "handle" in result && "shape" in result) {
+          buffers.add(result as DevBuffer);
+        }
+        return result;
+      };
+    },
+  });
+  return { ops, cleanup: () => {
+    for (const b of buffers) if (!b.view) device.dispose(b);
+    buffers.clear();
+  } };
+}
+
 /**
  * Runs the whole device suite. `reference` defaults to the CPU engine, which is
  * the definition of correct here: the accelerated path exists to be a faster
@@ -327,12 +351,14 @@ function buildCases(): DeviceCase[] {
 export async function verifyDevice(device: GpuOps, reference: GpuOps = new CpuOps()): Promise<DeviceCheck[]> {
   const checks: DeviceCheck[] = [];
   const tolerance = 3e-4;
+  const candidate = trackedDevice(device);
+  const baseline = trackedDevice(reference);
 
   for (const c of buildCases()) {
     let name = c.name;
     try {
-      const expected = await reference.toHost(await c.build(reference, prng(0x51ed)));
-      const actual = await device.toHost(await c.build(device, prng(0x51ed)));
+      const expected = await reference.toHost(await c.build(baseline.ops, prng(0x51ed)));
+      const actual = await device.toHost(await c.build(candidate.ops, prng(0x51ed)));
       if (actual.length !== expected.length) {
         checks.push({
           name,
@@ -377,12 +403,16 @@ export async function verifyDevice(device: GpuOps, reference: GpuOps = new CpuOp
         tolerance: 0,
         message: e instanceof Error ? e.message : String(e),
       });
+    } finally {
+      candidate.cleanup();
+      baseline.cleanup();
     }
   }
 
   // A device only earns trust if it also survives a full pass without erroring.
   try {
-    await device.zeros([1]);
+    const probe = await device.zeros([1]);
+    device.dispose(probe);
     checks.push({ name: "device stays healthy after the suite", passed: true, maxDiff: 0, tolerance: 0, message: "ok" });
   } catch (e) {
     checks.push({
