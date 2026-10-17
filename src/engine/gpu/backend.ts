@@ -11,8 +11,8 @@ import { CpuOps } from "./cpu";
 import { WebGpuDevice } from "../webgpu/device";
 import type { DeviceInfo, GpuOps } from "./ops";
 
-export type BackendKind = "cpu" | "webgpu";
-export type BackendPreference = "auto" | "cpu" | "webgpu";
+export type BackendKind = "cpu" | "webgpu" | "tensorflow";
+export type BackendPreference = "auto" | "cpu" | "webgpu" | "tensorflow";
 
 export interface BackendStatus {
   kind: BackendKind;
@@ -32,6 +32,9 @@ export interface AcquiredBackend {
   info: DeviceInfo;
   status: BackendStatus;
 }
+
+let cachedTensorFlow: GpuOps | null = null;
+let creatingTensorFlow: Promise<GpuOps> | null = null;
 
 let cachedDevice: WebGpuDevice | null = null;
 let creating: Promise<WebGpuDevice | null> | null = null;
@@ -89,6 +92,27 @@ export async function acquireBackend(preference: BackendPreference): Promise<Acq
     );
   }
 
+  if (preference === "tensorflow") {
+    try {
+      if (!cachedTensorFlow) {
+        creatingTensorFlow ??= import("./tensorflow").then(m => m.TensorFlowOps.create());
+        try { cachedTensorFlow = await creatingTensorFlow; }
+        finally { creatingTensorFlow = null; }
+      }
+      const ops = cachedTensorFlow;
+      return {
+        ops, info: ops.info,
+        status: {
+          kind: "tensorflow", label: ops.info.label,
+          detail: "TensorFlow.js selected in Settings (WebGL when available, otherwise TFJS CPU). Kernels are verified before training.",
+          preference, webgpuAvailable: available,
+        },
+      };
+    } catch (e) {
+      return cpu("TensorFlow.js could not initialize; using the custom CPU engine.", message(e));
+    }
+  }
+
   if (!available) {
     const reason = "WebGPU is not available in this browser (navigator.gpu is missing).";
     if (preference === "webgpu") return cpu(reason, reason);
@@ -117,6 +141,8 @@ export async function acquireBackend(preference: BackendPreference): Promise<Acq
 
 /** Drops the cached device, e.g. after a device loss or a preference change. */
 export function releaseBackend(): void {
+  cachedTensorFlow?.destroy();
+  cachedTensorFlow = null;
   if (cachedDevice) {
     try {
       cachedDevice.destroy();

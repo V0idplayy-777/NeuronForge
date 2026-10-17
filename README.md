@@ -11,7 +11,7 @@ Browser-based neural network laboratory. Models, gradients, losses, and metrics 
 - Losses: MSE, MAE, BCE, categorical CE, sparse CE
 - IndexedDB project persistence (localStorage fallback)
 - Cooperative training loop (`setTimeout(0)` between batches) so the UI stays responsive; gradient-norm diagnostics are reduced every 10 steps by default (and at epoch boundaries), avoiding an extra full parameter-memory scan every update without changing gradients or optimizer results
-- Optional WebGPU (WGSL) compute backend, verified against the CPU engine before use; the CPU path is the default and the only requirement
+- Optional WebGPU (WGSL) and TensorFlow.js compute backends, verified against the CPU engine before use; the custom CPU path remains available everywhere
 
 ## Development
 
@@ -27,6 +27,29 @@ npm run build
 ```
 
 The Vite config emits a single `dist/index.html` (inlined JS/CSS).
+
+## TensorFlow.js backend
+
+TensorFlow.js 4.22 is bundled locally with the app — no account, API key, CDN or remote inference service is needed.
+
+1. Open **Settings → Computation backend → Tensor backend**.
+2. Select **TensorFlow.js — WebGL with TFJS CPU fallback**.
+3. Click **Verify device**, or start training to verify automatically. All 64 operation checks must agree with the custom CPU engine before TensorFlow.js is used.
+4. Train normally. The Training Lab resource card shows **TensorFlow.js · webgl** or **TensorFlow.js · cpu**, and the layer-placement counts. The selection persists across reloads.
+
+The adapter (`src/engine/gpu/tensorflow.ts`) implements the same operation interface as the WGSL device: matrix multiplication, convolution and its input/kernel gradients, pooling and its gradients, elementwise operations, activations (including the engine's tanh GELU approximation), softmax, reductions and embedding gather/scatter. TensorFlow.js selects WebGL when available, otherwise its CPU backend. Initialization or verification failures leave training on the custom CPU engine. This explicit selection does not change Auto's existing WebGPU/CPU policy.
+
+The existing CPU model weights remain authoritative. Losses, optimizers, diagnostics, checkpoints and standalone exports retain their existing formats and behavior. Recurrent cells, normalization, dropout, attention and transformer layers still use the custom CPU engine through per-layer fallback. Evaluation/Inspector and exported inference runtimes also remain unchanged. This is a compute-backend integration, **not** TensorFlow.js Layers-model import/export or pretrained-model loading. Performance depends on model size and browser; per-batch weight/gradient transfers can make small models slower than the custom CPU engine.
+
+Run the integration tests (TFJS CPU, suitable for headless Node environments):
+
+```bash
+npm test
+npm run typecheck
+npm run build
+```
+
+Tests cover all 64 operations, multi-step gradient/optimizer parity, real Trainer epochs with validation, embedding edge cases, buffer ownership, repeated verification/inference cleanup, and backend selection. Browser-specific WebGL kernels are checked on the actual device by **Verify device** before use.
 
 ## Custom datasets
 

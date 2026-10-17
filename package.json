@@ -6,9 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
     "clsx": "2.1.1",
     "fflate": "^0.8.3",
     "react": "19.2.6",
@@ -23,6 +26,7 @@
     "@vitejs/plugin-react": "5.1.1",
     "@webgpu/types": "^0.1.74",
     "tailwindcss": "4.1.17",
+    "tsx": "^4.23.15",
     "typescript": "5.9.3",
     "vite": "7.3.2",
     "vite-plugin-singlefile": "2.3.0"

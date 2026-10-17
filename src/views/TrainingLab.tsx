@@ -159,7 +159,7 @@ export function TrainingLab() {
           </div>
           <div className="flex flex-wrap gap-2 mt-4">
             {!running && !paused && (
-              <Button onClick={() => void s.startTraining()} disabled={!s.model.valid}>
+              <Button onClick={() => void s.startTraining()} disabled={!s.model.valid || s.verifyingDevice}>
                 Start training
               </Button>
             )}
@@ -193,9 +193,9 @@ export function TrainingLab() {
             <Stat label="Est. memory" value={fmtBytes(mem.totalBytes)} />
             <Stat
               label="Backend"
-              value={s.backendStatus?.kind === "webgpu" && s.backendPlacements ? "WebGPU · WGSL" : "CPU · JS"}
+              value={s.backendStatus && s.backendStatus.kind !== "cpu" && s.backendPlacements ? s.backendStatus.label : "CPU · JS"}
               sub={
-                s.backendStatus?.kind === "webgpu" && s.backendPlacements
+                s.backendStatus && s.backendStatus.kind !== "cpu" && s.backendPlacements
                   ? `${s.backendPlacements.device} layers on device · ${s.backendPlacements.cpu} on CPU`
                   : s.webgpuAvailable
                     ? "float32, cooperative yielding · WebGPU available in Settings"
