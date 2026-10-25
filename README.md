@@ -107,7 +107,7 @@ Weight checksums include the layer key, so a tensor moved onto the wrong layer i
 
 NeuronForge is a from-scratch educational trainer, not a pretrained assistant service. It can train next-token models and demonstrate how capacity, tokenisation, and optimisation affect loss, but the bundled corpus is small and partly generated. Models trained here should **not** be expected to answer arbitrary questions, maintain reliable multi-turn conversations, or match a production language model. Useful general-purpose assistant quality requires substantially larger, curated instruction/conversation data and compute than a browser tab can provide.
 
-Four text datasets ship with the app, covering all three tokenizer levels — one token per character, one token per word, and learned subword merges:
+Six text datasets ship with the app, covering all three tokenizer levels — one token per character, one token per word, and learned subword merges — plus two specialist corpora (conversation and code):
 
 | | Tiny character LM | Tiny character LM 2 | Tiny BPE LM | Tiny BPE LM 2 |
 |---|---|---|---|---|
@@ -116,6 +116,24 @@ Four text datasets ship with the app, covering all three tokenizer levels — on
 | Corpus | ~7.6k chars, hand written | **~150k+ chars**, hand written + templated | ~7.6k chars, hand written | **~150k+ chars**, hand written + templated |
 | Vocabulary | ~35 characters | 3,000 word types (frequency-capped) | ~320 subword tokens (64–2048) | ~512 subword tokens (64–2048) |
 | Presets | char MLP, wider char MLP, char RNN | Word LM, Word LM (fast), Word RNN | Subword LSTM | Subword transformer (two sizes) |
+
+### NovaChat — the big conversation corpus
+
+**NovaChat** (`src/data/corpusChat.ts`, dataset `nova_chat`) is the large conversational dataset: ~2.4M characters / 23k+ lines / ~1.1M BPE tokens — several times the text and **over 5× the training tokens** of the largest previous corpus. It is built with one goal: a model trained on it should hold a recognisable conversation rather than complete fragments.
+
+- **One consistent persona** ("nova") with a fixed set of self-facts — name, age, favourite colour, what it can and cannot do — repeated in many phrasings and re-injected throughout the corpus, so a small model converges on *consistent* answers about itself.
+- **Real turn-taking.** Everything is `q: … a: …` turns, and multi-turn dialogues stay *adjacent* in the token stream (only block order is shuffled), so training windows learn what actually follows a question.
+- **Correct computed knowledge.** Arithmetic Q&A ("what is seven times eight…") is generated with the answer computed at build time — thousands of claims, all verified correct by the content checks.
+- **Fun on purpose:** jokes, riddles, trivia, tongue twisters, would-you-rather, and supportive replies to 10 emotional states.
+- 40-topic fact bank (ocean, volcanoes, sleep, mountains, bees, the moon, chocolate, friendship, …) × dialogue templates, feelings/situation dialogues, plus hand-written multi-turn conversations and short stories.
+
+Train **NovaChat transformer** (4 causal blocks) or **NovaChat GRU (fast)**, then prompt in the Evaluation playground with `q: how are you a:` — the playground default prompt switches to the corpus's house style automatically.
+
+### Python code — the code-generation corpus
+
+**Python code** (`src/data/corpusCode.ts`, dataset `python_code`) is the specialist dataset behind the new **Code** preset category: ~370k characters of complete, runnable python — functions, loops, classes, comprehensions, error handling, stdlib usage — where every snippet starts with a `# comment` stating the intent (teaching comment → code completion) and most end with an `assert` that proves it works. Generated variants (times tables, squares, fibonacci, divisibility, accumulation patterns) compute their expected values at build time, and the whole corpus was syntax-checked: all ~3,000 snippets compile.
+
+Because python's case is meaning (`None`, `True`, `ValueError`, `Counter`, CamelCase), this dataset trains a **case-sensitive BPE tokenizer** — an opt-in flag (`TokenizerSpec.caseSensitive`, default off everywhere else) that flows into exported bundles, and both standalone runtimes honour it (verified token-for-token in the self-tests). Prompt with `# reverse a list` and the model continues with the code.
 
 The BPE tokenizer (`src/data/bpe.ts`) **learns** its merges from the corpus at load time: it counts adjacent character pairs inside non-whitespace runs, repeatedly merges the most frequent pair, and stores the rule list with the dataset and in exported bundles. Training is deterministic (ties are broken by pair order), decoding is lossless — re-joining the tokens reproduces the lower-cased corpus exactly — and the merge count, vocabulary size, characters per token and unknown-character rate are reported in the Dataset Studio. The subword vocabulary size is adjustable per dataset (64–2048 tokens); whitespace is never merged into a token, so a decoded window keeps its original spacing.
 
@@ -151,7 +169,11 @@ Six sequence-capable architectures are available: character MLPs (flattened cont
 
 ## Presets
 
-51 presets in six categories (Classification, Regression, Vision, Autoencoder, Text, **Sequence**), from logistic-regression baselines to two-block CNNs, character-level language models, gated-cell language models and RNN/LSTM/GRU sequence forecasters. They include residual MLP and ResNet-pattern presets that stack residual blocks, char/word/subword language models built on LSTM and GRU cells, and attention presets: a causal self-attention LM, transformer language models over both the character and subword vocabularies, and an attention forecaster for the sequence dataset. Loading a preset also selects its matching dataset and recommended loss, so every preset trains immediately. Autoencoder presets automatically build a reconstruction dataset (targets = inputs).
+55 presets in seven categories (Classification, Regression, Vision, Autoencoder, Text, **Sequence**, **Code**), from logistic-regression baselines to two-block CNNs, character-level language models, gated-cell language models and RNN/LSTM/GRU sequence forecasters. They include residual MLP and ResNet-pattern presets that stack residual blocks, char/word/subword language models built on LSTM and GRU cells, and attention presets: a causal self-attention LM, transformer language models over both the character and subword vocabularies, and an attention forecaster for the sequence dataset. Loading a preset also selects its matching dataset and recommended loss, so every preset trains immediately. Autoencoder presets automatically build a reconstruction dataset (targets = inputs).
+
+**Text** includes the two NovaChat presets for the big conversation corpus: **NovaChat transformer** (Embedding → 4 causal transformer blocks, 6 heads / 96-dim → softmax over the ~768-token vocabulary) and **NovaChat GRU (fast)** (GRU(128), the budget baseline to compare against).
+
+**Code** is the new code-generation category, built around the case-sensitive Python corpus: **Python code transformer** (3 causal transformer blocks, 64-token context — enough to hold a whole function) and **Python code LSTM (fast)** (the quick-iteration baseline). Both align to the dataset's case-preserving vocabulary on load; the safe-starter batch/epoch policy applies to them exactly as it does to the Text presets.
 
 **Sequence** is a new, non-text category built around the **Wave sequence forecasting** dataset (`wave_seq`): each example is a 12-step window of a noisy two-frequency wave, and the target is the value immediately after it. It includes a baseline RNN forecaster, a deeper RNN forecaster, and a no-recurrence MLP baseline on the identical windows — so you can directly check whether recurrence is earning its complexity on a given task.
 

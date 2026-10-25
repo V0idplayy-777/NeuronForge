@@ -1198,7 +1198,8 @@ class StandaloneModel:
         ranks = self._bpe_ranks()
         if ranks is not None:
             ids = []
-            for chunk in re.findall(r"\s+|\S+", str(text).lower()):
+            source = str(text) if self.tokenizer.get("caseSensitive") else str(text).lower()
+            for chunk in re.findall(r"\s+|\S+", source):
                 symbols = list(chunk) if chunk[:1].isspace() else self._bpe_encode_chunk(chunk, ranks)
                 for symbol in symbols:
                     ids.append(self._stoi.get(symbol, 0))

@@ -420,10 +420,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
       }
       pushArch(archToLoad, false);
-      // Text models can have large optimizer state and attention workspaces.
+      // Text and code models can have large optimizer state and attention workspaces.
       // Start with a bounded, device-sensitive batch and short smoke-test run;
       // users can increase epochs after confirming the run fits their device.
-      if (pr.category === "Text") {
+      if (pr.category === "Text" || pr.category === "Code") {
         const parameterCount = new SequentialModel(archToLoad).paramCount().trainable;
         const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
         const cores = navigator.hardwareConcurrency || 4;

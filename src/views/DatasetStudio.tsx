@@ -22,6 +22,15 @@ import { cn } from "../utils/cn";
 
 const COLORS = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f43f5e"];
 
+/** Built-in datasets with a user-adjustable BPE vocabulary, and their defaults. */
+const BPE_IDS: BuiltinId[] = ["tiny_text_bpe", "tiny_text_2_bpe", "nova_chat", "python_code"];
+const BPE_VOCAB_DEFAULTS: Partial<Record<BuiltinId, number>> = {
+  tiny_text_bpe: 320,
+  tiny_text_2_bpe: 512,
+  nova_chat: 768,
+  python_code: 1024,
+};
+
 export function DatasetStudio() {
   const s = useStore();
   const ds = s.dataset;
@@ -98,14 +107,14 @@ export function DatasetStudio() {
             <Field label="Classes">
               <Input type="number" min={2} max={5} value={s.synth.classes} onChange={(e) => s.setSynth({ classes: Number(e.target.value) || 2 }, false)} />
             </Field>
-            {(s.builtinId === "tiny_text_bpe" || s.builtinId === "tiny_text_2_bpe") && (
+            {BPE_IDS.includes(s.builtinId) && (
               <Field label="Subword vocab" hint={`${BPE_VOCAB_MIN}–${BPE_VOCAB_MAX} learned BPE tokens. Bigger vocabularies compress the text further but widen the output layer.`}>
                 <Input
                   type="number"
                   min={BPE_VOCAB_MIN}
                   max={BPE_VOCAB_MAX}
                   step={32}
-                  value={s.synth.bpeVocab ?? (s.builtinId === "tiny_text_bpe" ? 320 : 512)}
+                  value={s.synth.bpeVocab ?? BPE_VOCAB_DEFAULTS[s.builtinId]}
                   onChange={(e) => s.setSynth({ bpeVocab: Number(e.target.value) || undefined }, false)}
                 />
               </Field>
