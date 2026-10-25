@@ -13,6 +13,18 @@ import {
   type CorpusStats,
 } from "./corpusLarge";
 import { buildBpeTokenizer, encodeBpeWith, type BpeTokenizer, type MergeRule } from "./bpe";
+import {
+  buildNovaCorpus,
+  NOVA_SEQ_LEN,
+  NOVA_VOCAB_TARGET,
+  NOVA_MAX_WINDOWS,
+} from "./corpusChat";
+import {
+  buildPythonCorpus,
+  PY_SEQ_LEN,
+  PY_VOCAB_TARGET,
+  PY_MAX_WINDOWS,
+} from "./corpusCode";
 
 /** Vocabulary targets for the built-in subword (BPE) language datasets. */
 export const BPE_VOCAB_TARGET = 320;
@@ -97,6 +109,11 @@ export interface TokenizerSpec {
   /** Share of corpus tokens outside the vocabulary cap (word level only). */
   oovRate?: number;
   /**
+   * BPE level: true when the vocabulary was learned case-sensitively, so the
+   * runtime must NOT lowercase prompts before applying the merge rules.
+   */
+  caseSensitive?: boolean;
+  /**
    * BPE merge rules, in the order they were learned. Required for BPE level:
    * the runtime re-applies them to tokenise, exactly as this app does.
    */
@@ -140,7 +157,9 @@ export type BuiltinId =
   | "tiny_text"
   | "tiny_text_2"
   | "tiny_text_bpe"
-  | "tiny_text_2_bpe";
+  | "tiny_text_2_bpe"
+  | "nova_chat"
+  | "python_code";
 
 /** Context window length for the sequence-forecasting dataset. */
 export const SEQ_WINDOW = 12;
@@ -186,6 +205,8 @@ export const BUILTIN_INFO: Record<BuiltinId, { name: string; description: string
   tiny_text_2: { name: "Tiny character LM 2", description: `The massive word-level corpus: ${LM2_SEQ_LEN} words of context, a frequency-capped vocabulary, and a generated text corpus of greetings, dialogue, narrative, science, computing, history, food, music, sport, health and nature.`, task: "language", loss: "sparse_cce", shape: [LM2_SEQ_LEN], out: 1 },
   tiny_text_bpe: { name: "Tiny BPE LM", description: `Subword (BPE) next-token prediction over the built-in corpus: ${LM_SEQ_LEN} tokens of context from a ~${BPE_VOCAB_TARGET}-token vocabulary learned by merging the most frequent character pairs. Common words collapse to one or two tokens, so each context window carries far more text than the character-level dataset — and there is no <unk> for words, only for unseen characters.`, task: "language", loss: "sparse_cce", shape: [LM_SEQ_LEN], out: 1 },
   tiny_text_2_bpe: { name: "Tiny BPE LM 2", description: `Subword (BPE) language modelling on the massive generated corpus: ${LM2_SEQ_LEN} tokens of context, a ~${BPE2_VOCAB_TARGET}-token learned vocabulary, closed by construction — every word in the corpus can be spelled from the learned pieces. The realistic middle ground between the character and whole-word datasets.`, task: "language", loss: "sparse_cce", shape: [LM2_SEQ_LEN], out: 1 },
+  nova_chat: { name: "NovaChat — big conversation corpus", description: `The large conversational dataset, built for models that hold a conversation instead of completing fragments: a consistent persona ("nova"), thousands of q/a turns with multi-turn dialogues kept adjacent, correct computed arithmetic, jokes, riddles, trivia and supportive replies to feelings. ${NOVA_SEQ_LEN} tokens of context, a ~${NOVA_VOCAB_TARGET}-token BPE vocabulary. Train a transformer on it, then prompt with "q: ..." and a colon — the model answers in character.`, task: "language", loss: "sparse_cce", shape: [NOVA_SEQ_LEN], out: 1 },
+  python_code: { name: "Python code (BPE, case-preserving)", description: `The Python specialist corpus for the code-generation presets: complete, runnable snippets — functions, loops, classes, comprehensions, stdlib usage — each introduced by a comment, most closed by an assert that proves it works. Tokenised with a CASE-SENSITIVE BPE vocabulary (~${PY_VOCAB_TARGET} tokens, ${PY_SEQ_LEN} tokens of context), so None, True, ValueError and CamelCase names survive intact. Prompt with a comment like "# reverse a list" and let the model write the code.`, task: "language", loss: "sparse_cce", shape: [PY_SEQ_LEN], out: 1 },
 };
 
 export function generateBuiltin(id: BuiltinId, params: SynthParams = DEFAULT_SYNTH): PreparedDataset {
@@ -419,6 +440,69 @@ export function generateBuiltin(id: BuiltinId, params: SynthParams = DEFAULT_SYN
       };
       break;
     }
+    case "nova_chat": {
+      const seq = NOVA_SEQ_LEN;
+      const { text, stats } = buildNovaCorpus(params.seed + 777);
+      corpusStats = stats;
+      const tok = buildBpeTokenizer(text, bpeCap(params.bpeVocab, NOVA_VOCAB_TARGET), seq);
+      const ids = encodeBpeWith(tok, text);
+      const meta: DatasetMeta = {
+        id,
+        name: info.name,
+        description: info.description,
+        source: "builtin",
+        task: info.task,
+        featureNames: Array.from({ length: seq }, (_, i) => `t-${seq - i}`),
+        targetNames: ["next_token"],
+        classNames: tok.tokens.slice(),
+        recommendedLoss: "sparse_cce",
+        inputShape: [seq],
+        outputUnits: tok.vocabSize,
+        attribution: attributionFor(id, stats, { level: "bpe", tokens: tok.tokens, merges: tok.merges.map(([a, b]) => [a, b] as MergeRule), seqLen: seq, padToken: " " }),
+        tokenizer: {
+          level: "bpe",
+          tokens: tok.tokens.slice(),
+          merges: tok.merges.map(([a, b]) => [a, b] as MergeRule),
+          seqLen: seq,
+          padToken: " ",
+          oovRate: 0,
+        },
+      };
+      return packLmWindows(meta, ids, seq, NOVA_MAX_WINDOWS, params);
+    }
+    case "python_code": {
+      const seq = PY_SEQ_LEN;
+      const { text, stats } = buildPythonCorpus(params.seed + 31337);
+      corpusStats = stats;
+      // Case-sensitive BPE: python's None/True/ValueError must not be folded
+      // into lowercase words, or the generated code cannot run.
+      const tok = buildBpeTokenizer(text, bpeCap(params.bpeVocab, PY_VOCAB_TARGET), seq, true);
+      const ids = encodeBpeWith(tok, text);
+      const meta: DatasetMeta = {
+        id,
+        name: info.name,
+        description: info.description,
+        source: "builtin",
+        task: info.task,
+        featureNames: Array.from({ length: seq }, (_, i) => `t-${seq - i}`),
+        targetNames: ["next_token"],
+        classNames: tok.tokens.slice(),
+        recommendedLoss: "sparse_cce",
+        inputShape: [seq],
+        outputUnits: tok.vocabSize,
+        attribution: attributionFor(id, stats, { level: "bpe", tokens: tok.tokens, merges: tok.merges.map(([a, b]) => [a, b] as MergeRule), seqLen: seq, padToken: " ", caseSensitive: true }),
+        tokenizer: {
+          level: "bpe",
+          tokens: tok.tokens.slice(),
+          merges: tok.merges.map(([a, b]) => [a, b] as MergeRule),
+          seqLen: seq,
+          padToken: " ",
+          oovRate: 0,
+          caseSensitive: true,
+        },
+      };
+      return packLmWindows(meta, ids, seq, PY_MAX_WINDOWS, params);
+    }
     case "tiny_text_2": {
       const seq = LM2_SEQ_LEN;
       inputShape = [seq];
@@ -486,6 +570,17 @@ function attributionFor(
   if ((id === "tiny_text_bpe" || id === "tiny_text_2_bpe") && tok && tok.level === "bpe") {
     const merges = tok.merges?.length ?? 0;
     return `Built-in corpus tokenised with BPE (${merges} learned merges, ${tok.tokens.length.toLocaleString()} tokens, ${tok.seqLen}-token context). The merge rules are saved with exported models, so the exported runtime tokenises exactly as this app does.`;
+  }
+  if ((id === "nova_chat" || id === "python_code") && stats && tok && tok.level === "bpe") {
+    const merges = tok.merges?.length ?? 0;
+    const subject = id === "nova_chat" ? "NovaChat conversation corpus" : "Python code corpus";
+    const casing = tok.caseSensitive ? "case-sensitive " : "";
+    return (
+      `${subject}: ${stats.chars.toLocaleString()} characters, ${stats.lines.toLocaleString()} lines, ` +
+      `${stats.tokens.toLocaleString()} words, ${stats.uniqueTokens.toLocaleString()} unique word types. ` +
+      `Tokenised with a ${casing}BPE vocabulary (${merges.toLocaleString()} learned merges, ${tok.tokens.length.toLocaleString()} tokens, ${tok.seqLen}-token context). ` +
+      `Generated locally in the browser — deterministic for a given seed, nothing downloaded. Merge rules are saved with exported models.`
+    );
   }
   if (id === "tiny_text_2" && stats && tok) {
     return (
@@ -572,6 +667,43 @@ export function splitRows(
     testY.push(trainY[0]!);
   }
   return { train: [trainX, trainY], val: [valX, valY], test: [testX, testY] };
+}
+
+/**
+ * Build a next-token language dataset straight from a token-id stream.
+ *
+ * The big corpora encode to ~1M tokens; materialising one JS array per window
+ * (the number[][] path used by the small datasets) would cost hundreds of
+ * megabytes of intermediate garbage. This fills the Float32Arrays directly:
+ * windows at a bounded stride, shuffled by seed, split by the generator
+ * fractions — the same policy as splitRows, without the copies.
+ */
+function packLmWindows(meta: DatasetMeta, ids: number[], seq: number, maxWindows: number, params: SynthParams): PreparedDataset {
+  const span = ids.length - seq;
+  const stride = Math.max(1, Math.ceil(span / maxWindows));
+  const starts: number[] = [];
+  for (let i = 0; i + seq < ids.length; i += stride) starts.push(i);
+  const idx = new RNG(params.seed + 99).shuffle(starts);
+  const nTrain = Math.max(1, Math.floor(idx.length * params.trainFrac));
+  const nVal = Math.max(1, Math.floor(idx.length * params.valFrac));
+  const groups = [idx.slice(0, nTrain), idx.slice(nTrain, nTrain + nVal), idx.slice(nTrain + nVal)];
+
+  const make = (rows: number[]): SplitSet => {
+    if (rows.length === 0) return { xs: Tensor.zeros([1, seq]), ys: Tensor.zeros([1, 1]) };
+    const xd = new Float32Array(rows.length * seq);
+    const yd = new Float32Array(rows.length);
+    for (let r = 0; r < rows.length; r++) {
+      const start = rows[r]!;
+      for (let k = 0; k < seq; k++) xd[r * seq + k] = ids[start + k]!;
+      yd[r] = ids[start + seq]!;
+    }
+    return { xs: new Tensor([rows.length, seq], xd), ys: new Tensor([rows.length, 1], yd) };
+  };
+
+  const [train, val, test] = groups.map(make);
+  const allX = concatSplit([train!.xs, val!.xs, test!.xs]);
+  const allY = concatSplit([train!.ys, val!.ys, test!.ys]);
+  return { meta, train: train!, val: val!, test: test!, allX, allY };
 }
 
 export function pack(

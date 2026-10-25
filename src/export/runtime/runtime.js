@@ -1092,8 +1092,8 @@ function nfBpeEncodeChunk(chunk, ranks) {
 }
 
 /** BPE encode: whitespace stays as single characters, unseen symbols -> id 0. */
-function nfBpeEncode(text, ranks, stoi) {
-  var lower = String(text).toLowerCase();
+function nfBpeEncode(text, ranks, stoi, caseSensitive) {
+  var lower = caseSensitive ? String(text) : String(text).toLowerCase();
   var chunks = nfBpeChunks(lower);
   var ids = [];
   for (var c = 0; c < chunks.length; c++) {
@@ -1379,7 +1379,7 @@ function createModel(bundle, options) {
         return stoi.has(w) ? stoi.get(w) : 0;
       });
     }
-    if (tok.level === "bpe" && bpeRanks) return nfBpeEncode(text, bpeRanks, stoi);
+    if (tok.level === "bpe" && bpeRanks) return nfBpeEncode(text, bpeRanks, stoi, !!tok.caseSensitive);
     var ids = [];
     var chars = String(text).toLowerCase().split("");
     for (var i = 0; i < chars.length; i++) if (stoi.has(chars[i])) ids.push(stoi.get(chars[i]));

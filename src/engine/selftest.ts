@@ -68,6 +68,8 @@ import {
 } from "./webgpu/sim";
 import { TEXT_CORPUS, TEXT_CHARS, LM_SEQ_LEN } from "../data/corpus";
 import { buildMassiveCorpus, buildWordTokenizer, encodeWordsToIds, decodeTokenIds, tokenizeWords, LM2_SEQ_LEN } from "../data/corpusLarge";
+import { buildNovaCorpus } from "../data/corpusChat";
+import { buildPythonCorpus } from "../data/corpusCode";
 import { sampleFromProbs } from "./sampling";
 import { tokenizeForModel, detokenize, generateTokens } from "./generate";
 import type { Architecture } from "./types";
@@ -407,7 +409,7 @@ export function runSelfTests(): TestResult[] {
 
   tests.push(
     run("new presets compile and forward-pass finite (one per category incl. Sequence)", () => {
-      for (const id of ["noise-robust-clf", "layernorm-reg", "cnn-batchnorm", "ae-layernorm", "char-rnn-seq", "seq-rnn", "seq-rnn-deep", "seq-mlp-baseline"]) {
+      for (const id of ["noise-robust-clf", "layernorm-reg", "cnn-batchnorm", "ae-layernorm", "char-rnn-seq", "seq-rnn", "seq-rnn-deep", "seq-mlp-baseline", "novachat-transformer", "novachat-gru", "python-code-transformer", "python-code-lstm"]) {
         const p = PRESETS.find((x) => x.id === id);
         expect(!!p, `missing preset ${id}`);
         const m = new SequentialModel(p!.arch);
@@ -827,6 +829,115 @@ export function runSelfTests(): TestResult[] {
         expect(encoded.filter((id) => id === 0).length === 0, `unknown tokens with vocab ${vocab}`);
         expect(bpeDecode(encoded, ds.meta.tokenizer!.tokens) === TEXT_CORPUS.toLowerCase(), `round trip broke at vocab ${vocab}`);
       }
+    }),
+  );
+
+  tests.push(
+    run("NovaChat corpus is large, conversational, and self-consistent", () => {
+      const { text, stats } = buildNovaCorpus(1234 + 777);
+      expect(stats.chars > 1_800_000, `corpus is only ${stats.chars.toLocaleString()} chars`);
+      expect(stats.lines > 18_000, `only ${stats.lines} lines`);
+      // The persona must be stated, consistently, many times.
+      const personaHits = (text.match(/my name is nova/g) ?? []).length;
+      expect(personaHits >= 8, `persona name stated only ${personaHits} times`);
+      // Turn format is the backbone of the dataset.
+      const turns = (text.match(/q: /g) ?? []).length;
+      expect(turns > 15_000, `only ${turns} question turns`);
+      expect((text.match(/a: /g) ?? []).length > 15_000, "answer turns missing");
+      // Multi-turn dialogues must stay adjacent (block shuffle, not line shuffle):
+      // this exact 2-turn exchange exists in the hand written bank.
+      const adjacent = "q: okay a: you feel the ground with your feet and step downhill. small steps, many times\nq: and the dark part a:";
+      expect(text.includes(adjacent), "dialogue turns were split apart by the shuffle");
+      // Computed arithmetic is present and correct (the generator computed it).
+      expect(text.includes("q: what is two plus three a: two plus three is five"), "simple sum missing");
+      expect(text.includes("q: what is seven times eight a: seven times eight is fifty six"), "times table missing");
+    }),
+  );
+
+  tests.push(
+    run("nova_chat dataset: windows, tokenizer and id ranges agree", () => {
+      const ds = generateBuiltin("nova_chat", { ...DEFAULT_SYNTH, seed: 11 });
+      const tok = ds.meta.tokenizer!;
+      expect(tok.level === "bpe", `level ${tok.level}`);
+      expect(ds.meta.task === "language", "task is not language");
+      expect(ds.meta.outputUnits === tok.tokens.length, `output units ${ds.meta.outputUnits} != vocab ${tok.tokens.length}`);
+      expect(ds.meta.inputShape[0] === tok.seqLen, "context length mismatch");
+      const nTrain = ds.train.xs.shape[0]!;
+      expect(nTrain > 40_000, `only ${nTrain} training windows — this is supposed to be the big one`);
+      let worst = 0;
+      for (let i = 0; i < ds.train.xs.size; i++) worst = Math.max(worst, ds.train.xs.data[i]!);
+      for (let i = 0; i < ds.train.ys.size; i++) worst = Math.max(worst, ds.train.ys.data[i]!);
+      expect(worst < tok.tokens.length, `token id ${worst} outside the ${tok.tokens.length}-token vocabulary`);
+      // A training window must decode to readable text.
+      const window: number[] = [];
+      for (let i = 0; i < tok.seqLen; i++) window.push(ds.train.xs.data[i]!);
+      const decoded = bpeDecode(window, tok.tokens);
+      expect(/[a-z]/.test(decoded) && decoded.length >= tok.seqLen, `window decoded to ${JSON.stringify(decoded.slice(0, 40))}`);
+    }),
+  );
+
+  tests.push(
+    run("python_code dataset: case-preserving BPE keeps real python intact", () => {
+      // Unit level: the flag changes lowercasing behaviour, default stays lowercase.
+      const sample = "def f():\n    return None  # True";
+      const ci = trainBpe(sample + "\ndef g():\n    return True\n", 64);
+      const ciIds = bpeEncode(sample, ci.tokens, ci.merges);
+      expect(bpeDecode(ciIds, ci.tokens) === sample.toLowerCase(), "default BPE must still lowercase");
+      const cs = trainBpe(sample + "\ndef g():\n    return True\n", 64, { caseSensitive: true });
+      const csIds = bpeEncode(sample, cs.tokens, cs.merges, true);
+      expect(bpeDecode(csIds, cs.tokens) === sample, "case-sensitive round trip lost case");
+
+      // Dataset level: python corpus keeps None/True/CamelCase, ids stay in range.
+      const { text: pyText } = buildPythonCorpus(99 + 31337);
+      expect(pyText.includes("return None"), "python corpus lost None");
+      expect(pyText.includes("ZeroDivisionError"), "python corpus lost builtin exception names");
+      const ds = generateBuiltin("python_code", { ...DEFAULT_SYNTH, seed: 12 });
+      const tok = ds.meta.tokenizer!;
+      expect(tok.level === "bpe" && tok.caseSensitive === true, "python tokenizer is not case-sensitive bpe");
+      expect(tok.tokens.some((t) => /[A-Z]/.test(t)), "no uppercase tokens learned");
+      expect(ds.meta.outputUnits === tok.tokens.length, "output units != vocabulary");
+      let worst = 0;
+      for (let i = 0; i < ds.train.xs.size; i++) worst = Math.max(worst, ds.train.xs.data[i]!);
+      for (let i = 0; i < ds.train.ys.size; i++) worst = Math.max(worst, ds.train.ys.data[i]!);
+      expect(worst < tok.tokens.length, `token id ${worst} outside the vocabulary`);
+      const window: number[] = [];
+      for (let i = 0; i < tok.seqLen; i++) window.push(ds.train.xs.data[i]!);
+      expect(/[a-z]/.test(bpeDecode(window, tok.tokens)), "code window decoded to garbage");
+    }),
+  );
+
+  tests.push(
+    run("standalone export: case-sensitive BPE tokenizer parity in the runtime", () => {
+      const ds = generateBuiltin("python_code", { ...DEFAULT_SYNTH, seed: 12 });
+      const tok = ds.meta.tokenizer!;
+      const arch = alignToVocab(
+        {
+          inputShape: [tok.seqLen],
+          inputName: "input",
+          seed: 42,
+          initMethod: "xavier_normal",
+          layers: [
+            makeLayerDef("embedding", { name: "embed", config: { vocabSize: tok.tokens.length, embeddingDim: 16 } }),
+            makeLayerDef("flatten", { name: "flatten" }),
+            makeLayerDef("dense", { name: "logits", config: { units: tok.tokens.length, useBias: true, activation: "none" } }),
+            makeLayerDef("softmax", { name: "softmax" }),
+          ],
+        },
+        tok.tokens.length,
+        tok.seqLen,
+      );
+      const model = new SequentialModel(arch);
+      const { bundle } = buildStandaloneBundle(model, ds, { name: "py-lm", project: "t", loss: "sparse_cce", trained: false });
+      expect(bundle.tokenizer?.caseSensitive === true, "case-sensitive flag not embedded in the bundle");
+      const r = verifyStandalone(bundle, model, ds);
+      const failed = r.checks.filter((c) => c.status === "fail");
+      expect(r.ok, failed.map((c) => `${c.label}: ${c.detail}`).join(" | "));
+      // The runtime must NOT lowercase for this tokenizer: mixed-case text
+      // encodes differently than its lowercase form.
+      const rt = loadRuntime().createModel(bundle);
+      const upper = rt.tokenize("None True ValueError");
+      const lower = rt.tokenize("none true valueerror");
+      expect(JSON.stringify(upper) !== JSON.stringify(lower), "runtime lowercased a case-sensitive tokenizer");
     }),
   );
 

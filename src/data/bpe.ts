@@ -39,6 +39,8 @@ export interface BpeModel {
   /** Distinct symbols that actually occur after merging. */
   symbolsInUse: number;
   corpusChars: number;
+  /** True when the vocabulary was learned without lowercasing. */
+  caseSensitive: boolean;
 }
 
 export interface BpeOptions {
@@ -46,6 +48,14 @@ export interface BpeOptions {
   maxMerges?: number;
   /** Stop early when the best pair occurs fewer than this many times. */
   minFrequency?: number;
+  /**
+   * Keep letter case instead of lowercasing. Off by default, which preserves
+   * the exact behaviour of every existing dataset and exported runtime. The
+   * code corpora turn it on so python's `None`, `True` and `ValueError` stay
+   * distinct from lowercase words — the flag is stored in the tokenizer spec
+   * so exported runtimes encode identically.
+   */
+  caseSensitive?: boolean;
   /** Progress callback for long trainings. */
   onProgress?: (info: { merges: number; vocabSize: number; pairsConsidered: number }) => void;
   progressEvery?: number;
@@ -90,7 +100,7 @@ const SEP = "\u0000";
  * merge, so ids are stable for a given corpus and target size.
  */
 export function trainBpe(text: string, targetVocabSize: number, options: BpeOptions = {}): BpeModel {
-  const lower = text.toLowerCase();
+  const lower = options.caseSensitive ? text : text.toLowerCase();
   const chars = [...new Set(lower.split("").filter((c) => !isWhitespace(c)))].sort();
   const wsChars = [...new Set(lower.split("").filter((c) => isWhitespace(c)))].sort();
   const tokens = [UNK_TOKEN, ...chars, ...wsChars];
@@ -174,6 +184,7 @@ export function trainBpe(text: string, targetVocabSize: number, options: BpeOpti
     symbolsAfter,
     symbolsInUse: inUse.size,
     corpusChars: lower.length,
+    caseSensitive: options.caseSensitive === true,
   };
 }
 
@@ -183,14 +194,16 @@ export interface EncodeTable {
   /** token -> id. */
   stoi: Map<string, number>;
   unknownId: number;
+  /** Keep letter case when encoding (mirrors how the vocabulary was learned). */
+  caseSensitive: boolean;
 }
 
-export function encodeTable(tokens: string[], merges: MergeRule[]): EncodeTable {
+export function encodeTable(tokens: string[], merges: MergeRule[], caseSensitive = false): EncodeTable {
   const ranks = new Map<string, number>();
   merges.forEach(([a, b], i) => ranks.set(a + SEP + b, i));
   const stoi = new Map<string, number>();
   tokens.forEach((t, i) => stoi.set(t, i));
-  return { ranks, stoi, unknownId: 0 };
+  return { ranks, stoi, unknownId: 0, caseSensitive };
 }
 
 /** Apply the merge rules to one non-whitespace chunk. */
@@ -215,7 +228,8 @@ export function bpeEncodeChunk(chunk: string, ranks: Map<string, number>): strin
 /** Token strings for arbitrary text (whitespace characters stay individual tokens). */
 export function bpeTokenizeWith(table: EncodeTable, text: string): string[] {
   const out: string[] = [];
-  for (const { chunk, mergeable } of bpeChunks(text.toLowerCase())) {
+  const source = table.caseSensitive ? text : text.toLowerCase();
+  for (const { chunk, mergeable } of bpeChunks(source)) {
     if (!mergeable) {
       for (const ch of chunk) out.push(ch);
       continue;
@@ -225,8 +239,8 @@ export function bpeTokenizeWith(table: EncodeTable, text: string): string[] {
   return out;
 }
 
-export function bpeTokenize(text: string, tokens: string[], merges: MergeRule[]): string[] {
-  return bpeTokenizeWith(encodeTable(tokens, merges), text);
+export function bpeTokenize(text: string, tokens: string[], merges: MergeRule[], caseSensitive = false): string[] {
+  return bpeTokenizeWith(encodeTable(tokens, merges, caseSensitive), text);
 }
 
 /** Token ids for arbitrary text; unseen characters become id 0 (`<unk>`). */
@@ -239,8 +253,8 @@ export function bpeEncodeWith(table: EncodeTable, text: string): number[] {
   return out;
 }
 
-export function bpeEncode(text: string, tokens: string[], merges: MergeRule[]): number[] {
-  return bpeEncodeWith(encodeTable(tokens, merges), text);
+export function bpeEncode(text: string, tokens: string[], merges: MergeRule[], caseSensitive = false): number[] {
+  return bpeEncodeWith(encodeTable(tokens, merges, caseSensitive), text);
 }
 
 /** Inverse of encoding: concatenating the tokens rebuilds the text exactly. */
@@ -262,7 +276,7 @@ export function bpeStats(model: BpeModel, text: string): {
   singleCharTokens: number;
   longestToken: string;
 } {
-  const table = encodeTable(model.tokens, model.merges);
+  const table = encodeTable(model.tokens, model.merges, model.caseSensitive);
   const ids = bpeEncodeWith(table, text);
   let unknown = 0;
   let singleCharTokens = 0;
@@ -300,6 +314,8 @@ export interface BpeTokenizer {
   compression: number;
   corpusChars: number;
   mergesLearned: number;
+  /** True when the vocabulary was learned without lowercasing. */
+  caseSensitive: boolean;
 }
 
 /**
@@ -307,12 +323,12 @@ export interface BpeTokenizer {
  * pair, and memoised because the Dataset Studio rebuilds language datasets on
  * every generator change.
  */
-export function buildBpeTokenizer(corpus: string, vocabSizeCap: number, seqLen: number): BpeTokenizer {
-  const cacheKey = `${vocabSizeCap}|${seqLen}|${corpus.length}|${corpus.charCodeAt(0)}|${corpus.slice(0, 48)}|${corpus.slice(-48)}`;
+export function buildBpeTokenizer(corpus: string, vocabSizeCap: number, seqLen: number, caseSensitive = false): BpeTokenizer {
+  const cacheKey = `${vocabSizeCap}|${seqLen}|${caseSensitive ? "cs" : "ci"}|${corpus.length}|${corpus.charCodeAt(0)}|${corpus.slice(0, 48)}|${corpus.slice(-48)}`;
   const cached = bpeCache.get(cacheKey);
   if (cached) return cloneBpeTokenizer(cached);
 
-  const model = trainBpe(corpus, vocabSizeCap, { minFrequency: 3 });
+  const model = trainBpe(corpus, vocabSizeCap, { minFrequency: 3, caseSensitive });
   const stats = bpeStats(model, corpus);
   const tokenToId: Record<string, number> = {};
   model.tokens.forEach((t, i) => {
@@ -330,6 +346,7 @@ export function buildBpeTokenizer(corpus: string, vocabSizeCap: number, seqLen: 
     compression: stats.compression,
     corpusChars: model.corpusChars,
     mergesLearned: model.merges.length,
+    caseSensitive,
   };
   bpeCache.set(cacheKey, tokenizer);
   return cloneBpeTokenizer(tokenizer);
@@ -355,7 +372,7 @@ export function encodeBpe(text: string, tokens?: string[], merges?: MergeRule[])
 }
 
 export function encodeBpeWith(tok: BpeTokenizer, text: string): number[] {
-  return bpeEncodeWith(encodeTable(tok.tokens, tok.merges), text);
+  return bpeEncodeWith(encodeTable(tok.tokens, tok.merges, tok.caseSensitive), text);
 }
 
 export function decodeBpeIds(ids: number[], tokens: string[]): string {

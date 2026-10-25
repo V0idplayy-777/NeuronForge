@@ -5,12 +5,14 @@ import type { LayerType } from "./types";
 import { LM_SEQ_LEN, TEXT_VOCAB_SIZE } from "../data/corpus";
 import { BPE_VOCAB_TARGET, BPE2_VOCAB_TARGET } from "../data/datasets";
 import { LM2_SEQ_LEN } from "../data/corpusLarge";
+import { NOVA_SEQ_LEN, NOVA_VOCAB_TARGET } from "../data/corpusChat";
+import { PY_SEQ_LEN, PY_VOCAB_TARGET } from "../data/corpusCode";
 import { SEQ_WINDOW } from "../data/datasets";
 
 export interface Preset {
   id: string;
   name: string;
-  category: "Classification" | "Regression" | "Vision" | "Autoencoder" | "Text" | "Sequence";
+  category: "Classification" | "Regression" | "Vision" | "Autoencoder" | "Text" | "Sequence" | "Code";
   description: string;
   datasetHint: string;
   arch: Architecture;
@@ -710,6 +712,67 @@ export const PRESETS: Preset[] = [
     ]),
   },
 
+  {
+    id: "novachat-transformer",
+    name: "NovaChat transformer",
+    category: "Text",
+    description: `The flagship preset for the big NovaChat conversation corpus: Embedding → 4 pre-LayerNorm Transformer Blocks (6 heads, 96-dim, causal) → softmax over the ~${NOVA_VOCAB_TARGET}-token BPE vocabulary, with ${NOVA_SEQ_LEN} tokens of context. Loading it switches to the NovaChat dataset and aligns the vocabulary automatically. Train it, then prompt in the Evaluation playground with "q: how are you a:" — the corpus's q/a turn format is what makes it answer in character.`,
+    datasetHint: "nova_chat",
+    arch: arch([NOVA_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: NOVA_VOCAB_TARGET, embeddingDim: 96 } }),
+      ...Array.from({ length: 4 }, (_, i) => makeLayerDef("transformer_block", {
+        name: `block${i + 1}`,
+        config: { heads: 6, dModel: 96, ffDim: 384, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: i === 3 ? "last" : "none", activation: "gelu", epsilon: 1e-5 },
+      })),
+      dense(NOVA_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ], 42, "xavier_normal"),
+  },
+  {
+    id: "novachat-gru",
+    name: "NovaChat GRU (fast)",
+    category: "Text",
+    description: `A budget conversational model on the same NovaChat corpus: Embedding → GRU(128) over ${NOVA_SEQ_LEN} subword tokens → softmax. Several times cheaper per epoch than the transformer — start here to check the corpus and prompt format, then scale up. The hidden state carries the conversation context; compare its validation loss against the transformer's.`,
+    datasetHint: "nova_chat",
+    arch: arch([NOVA_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: NOVA_VOCAB_TARGET, embeddingDim: 48 } }),
+      makeLayerDef("gru", { name: "gru", config: { units: 128, returnSequences: false } }),
+      dense(NOVA_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ]),
+  },
+
+  /* ---------------- Code ---------------- */
+  {
+    id: "python-code-transformer",
+    name: "Python code transformer",
+    category: "Code",
+    description: `Code generation for the Python corpus: Embedding → 3 causal Transformer Blocks (4 heads, 64-dim) → softmax over the ~${PY_VOCAB_TARGET}-token case-sensitive BPE vocabulary, with ${PY_SEQ_LEN} tokens of context — enough to hold a whole function. Loading it switches to the Python dataset and aligns the vocabulary. Prompt with a comment like "# reverse a list" in the Evaluation playground and it continues with the code; the corpus pairs every snippet with exactly that pattern.`,
+    datasetHint: "python_code",
+    arch: arch([PY_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: PY_VOCAB_TARGET, embeddingDim: 64 } }),
+      ...Array.from({ length: 3 }, (_, i) => makeLayerDef("transformer_block", {
+        name: `block${i + 1}`,
+        config: { heads: 4, dModel: 64, ffDim: 256, causal: true, useBias: true, dropout: 0.1, scale: 1, pool: i === 2 ? "last" : "none", activation: "gelu", epsilon: 1e-5 },
+      })),
+      dense(PY_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ], 42, "xavier_normal"),
+  },
+  {
+    id: "python-code-lstm",
+    name: "Python code LSTM (fast)",
+    category: "Code",
+    description: `A cheaper code model on the same Python corpus: Embedding → LSTM(96) over ${PY_SEQ_LEN} subword tokens → case-sensitive softmax. Code is highly local — indentation, brackets, colons — so an LSTM gets surprisingly far on snippet completion. Use it as the baseline to compare against the transformer, and as the preset that trains quickly enough to iterate on.`,
+    datasetHint: "python_code",
+    arch: arch([PY_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: PY_VOCAB_TARGET, embeddingDim: 32 } }),
+      makeLayerDef("lstm", { name: "lstm", config: { units: 96, returnSequences: false, forgetBias: 1 } }),
+      dense(PY_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ]),
+  },
+
   /* ---------------- Sequence ---------------- */
   {
     id: "seq-rnn",
@@ -854,7 +917,7 @@ export function alignToVocab(a: Architecture, vocabSize: number, seqLen: number)
   return copy;
 }
 
-export const PRESET_CATEGORIES: Preset["category"][] = ["Classification", "Regression", "Vision", "Autoencoder", "Text", "Sequence"];
+export const PRESET_CATEGORIES: Preset["category"][] = ["Classification", "Regression", "Vision", "Autoencoder", "Text", "Sequence", "Code"];
 
 export function presetById(id: string): Preset | undefined {
   return PRESETS.find((p) => p.id === id);

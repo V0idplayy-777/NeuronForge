@@ -18,7 +18,14 @@ export function Evaluation() {
   const [err, setErr] = useState<string | null>(null);
   const [inputs, setInputs] = useState<number[]>(() => Array(s.architecture.inputShape.reduce((a, b) => a * b, 1)).fill(0));
   const [pred, setPred] = useState<number[] | null>(null);
-  const [prompt, setPrompt] = useState("hello there");
+  const [prompt, setPrompt] = useState(() =>
+    // Start each language dataset with a prompt in its own house style.
+    s.dataset.meta.id === "nova_chat"
+      ? "q: hello there a:"
+      : s.dataset.meta.id === "python_code"
+        ? "# reverse a list"
+        : "hello there",
+  );
   const [gen, setGen] = useState("");
   const [temperature, setTemperature] = useState(0.7);
   const [topK, setTopK] = useState(50);

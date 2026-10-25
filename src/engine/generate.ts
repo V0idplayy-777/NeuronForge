@@ -48,7 +48,7 @@ export function tokenizeForModel(tok: TokenizerSpec, text: string): number[] {
       // A BPE tokenizer without merge rules would be a plain character
       // tokenizer; fall through to the character path rather than throwing.
     } else {
-      return bpeEncode(text, tok.tokens, tok.merges);
+      return bpeEncode(text, tok.tokens, tok.merges, tok.caseSensitive === true);
     }
   }
   const map = tokenMap(tok);
