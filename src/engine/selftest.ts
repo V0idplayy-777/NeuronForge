@@ -70,6 +70,7 @@ import { TEXT_CORPUS, TEXT_CHARS, LM_SEQ_LEN } from "../data/corpus";
 import { buildMassiveCorpus, buildWordTokenizer, encodeWordsToIds, decodeTokenIds, tokenizeWords, LM2_SEQ_LEN } from "../data/corpusLarge";
 import { buildNovaCorpus } from "../data/corpusChat";
 import { buildPythonCorpus } from "../data/corpusCode";
+import { buildReasonCorpus, REASON_SEQ_LEN } from "../data/corpusReason";
 import { sampleFromProbs } from "./sampling";
 import { tokenizeForModel, detokenize, generateTokens } from "./generate";
 import type { Architecture } from "./types";
@@ -409,7 +410,7 @@ export function runSelfTests(): TestResult[] {
 
   tests.push(
     run("new presets compile and forward-pass finite (one per category incl. Sequence)", () => {
-      for (const id of ["noise-robust-clf", "layernorm-reg", "cnn-batchnorm", "ae-layernorm", "char-rnn-seq", "seq-rnn", "seq-rnn-deep", "seq-mlp-baseline", "novachat-transformer", "novachat-gru", "python-code-transformer", "python-code-lstm"]) {
+      for (const id of ["noise-robust-clf", "layernorm-reg", "cnn-batchnorm", "ae-layernorm", "char-rnn-seq", "seq-rnn", "seq-rnn-deep", "seq-mlp-baseline", "novachat-transformer", "novachat-gru", "python-code-transformer", "python-code-lstm", "deep-reasoner-40k"]) {
         const p = PRESETS.find((x) => x.id === id);
         expect(!!p, `missing preset ${id}`);
         const m = new SequentialModel(p!.arch);
@@ -1451,9 +1452,174 @@ export function runSelfTests(): TestResult[] {
   );
 
   tests.push(
+    run("deep reasoning gradients match numerical gradients", () => {
+      const layer = compileLayer(
+        mkDef("reasoning_block", {
+          id: "rg",
+          name: "rg",
+          config: { steps: 4, hidden: 6, adaptive: false, activation: "gelu", stepCode: true, stepCodeScale: 1, epsilon: 1e-5 },
+        }),
+        [4],
+        new RNG(71),
+        "xavier_uniform",
+      );
+      const x = new Tensor([2, 4], Float32Array.from([0.2, -0.4, 0.7, 0.1, -0.3, 0.5, 0.15, -0.6]));
+      const dOut = new Tensor([2, 4], Float32Array.from([0.4, -0.7, 0.2, 0.9, -0.2, 0.3, 0.5, -0.1]));
+      const scalar = () => {
+        const y = layer.forward(x, false);
+        let s = 0;
+        for (let i = 0; i < y.size; i++) s += y.data[i]! * dOut.data[i]!;
+        return s;
+      };
+      layer.forward(x, false);
+      layer.backward(dOut);
+      const eps = 1e-3;
+      for (const name of ["W1", "W2", "Wgate", "ln_gamma", "ln_beta", "b1", "b2", "bgate"]) {
+        const t = layer.params[name]!;
+        const index = Math.min(t.size - 1, Math.floor(t.size / 2));
+        const analytic = layer.grads[name]!.data[index]!;
+        const orig = t.data[index]!;
+        t.data[index] = orig + eps;
+        const lp = scalar();
+        t.data[index] = orig - eps;
+        const lm = scalar();
+        t.data[index] = orig;
+        const numeric = (lp - lm) / (2 * eps);
+        expect(approx(analytic, numeric, 3e-2), `${name}[${index}]: analytic ${analytic} vs numeric ${numeric}`);
+      }
+    }),
+  );
+
+  tests.push(
+    run("deep reasoning: depth changes the output and adaptive halting really stops", () => {
+      const short = compileLayer(
+        mkDef("reasoning_block", { id: "rs", name: "rs", config: { steps: 3, hidden: 6, adaptive: false, stepCode: true } }),
+        [5],
+        new RNG(17),
+        "xavier_uniform",
+      );
+      const long = compileLayer(
+        mkDef("reasoning_block", { id: "rl", name: "rl", config: { steps: 7, hidden: 6, adaptive: false, stepCode: true } }),
+        [5],
+        new RNG(17),
+        "xavier_uniform",
+      );
+      for (const k of Object.keys(short.params)) long.params[k]!.data.set(short.params[k]!.data);
+      const x = new Tensor([1, 5], Float32Array.from([0.2, -0.5, 0.9, 0.1, -0.3]));
+      const a = short.forward(x, false);
+      const b = long.forward(x, false);
+      let diff = 0;
+      for (let i = 0; i < a.size; i++) diff = Math.max(diff, Math.abs(a.data[i]! - b.data[i]!));
+      expect(diff > 1e-3, `extra reasoning depth did not change the output (max |Δ| ${diff})`);
+      expect(short.reasoning?.trace?.stepsUsed === 3, `short trace ${short.reasoning?.trace?.stepsUsed}`);
+      expect(long.reasoning?.trace?.stepsUsed === 7, `long trace ${long.reasoning?.trace?.stepsUsed}`);
+
+      const adaptive = compileLayer(
+        mkDef("reasoning_block", { id: "ra", name: "ra", config: { steps: 8, hidden: 6, adaptive: true, haltThreshold: 0.9, minSteps: 2, stepCode: true } }),
+        [5],
+        new RNG(19),
+        "xavier_uniform",
+      );
+      adaptive.forward(x, false);
+      const used = adaptive.reasoning?.trace?.stepsUsed ?? 0;
+      expect(used >= 2 && used < 8, `adaptive halting should stop before the full depth, used ${used}`);
+      expect(adaptive.reasoning?.trace?.halted === true, "adaptive trace did not report halting");
+      adaptive.forward(x, true);
+      expect(adaptive.reasoning?.trace?.stepsUsed === 8, "training forwards must run the full depth");
+    }),
+  );
+
+  tests.push(
+    run("deep reasoner preset is ~40k parameters and really reasons", () => {
+      const p = PRESETS.find((x) => x.id === "deep-reasoner-40k");
+      expect(!!p, "deep-reasoner-40k preset missing");
+      const m = new SequentialModel(p!.arch);
+      expect(m.valid, m.issues[0]?.message ?? "invalid");
+      const total = m.paramCount().trainable + m.paramCount().nonTrainable;
+      expect(total >= 38_000 && total <= 42_000, `expected ~40k parameters, got ${total}`);
+      expect(m.reasoningLayers().length === 1, "preset must contain one Deep Reasoning block");
+      const inSize = p!.arch.inputShape.reduce((a, b) => a * b, 1);
+      const x = new Tensor([1, ...p!.arch.inputShape], Float32Array.from({ length: inSize }, (_, i) => i % 256));
+      const y = m.forward(x, false).output;
+      for (let i = 0; i < y.size; i++) expect(Number.isFinite(y.data[i]!), `output ${i} is ${y.data[i]}`);
+      const trace = m.reasoningLayers()[0]!.trace;
+      expect(!!trace && trace.stepsUsed > 1, "preset forward did not record a reasoning trace");
+    }),
+  );
+
+  tests.push(
+    run("reasoning corpus has explicit chain-of-thought and a closed tokenizer", () => {
+      const { text, stats } = buildReasonCorpus(1);
+      expect(text.includes("think:") && text.includes("a:"), "reasoning corpus lost its thought/answer format");
+      expect(stats.lines > 800, `only ${stats.lines} reasoning lines`);
+      const line = text.split("\n").find((l) => l.includes("think:"))!;
+      const thinkAt = line.indexOf("think:");
+      const answerAt = line.indexOf("a:");
+      expect(thinkAt >= 0 && answerAt > thinkAt, "answer must follow the thought trace");
+      const tok = buildWordTokenizer(text, 256, REASON_SEQ_LEN);
+      expect(tok.vocabSize >= 100 && tok.vocabSize < 256, `word vocab ${tok.vocabSize}`);
+      expect(tok.oovRate === 0, `reasoning corpus has ${(tok.oovRate * 100).toFixed(1)}% unknown words`);
+      const ids = tokenizeWords(text.slice(0, 200)).map((w) => tok.tokenToId[w] ?? 0);
+      expect(ids.every((id) => id >= 0 && id < tok.vocabSize), "token ids outside the vocabulary");
+      const longest = Math.max(...text.split("\n").map((l) => tokenizeWords(l).length));
+      expect(longest <= REASON_SEQ_LEN, `longest trace is ${longest} words, context is ${REASON_SEQ_LEN}`);
+    }),
+  );
+
+  tests.push(
+    run("native export round-trip preserves the deep reasoning plan and weights", () => {
+      const p = PRESETS.find((x) => x.id === "deep-reasoner-40k")!;
+      const model = new SequentialModel(p.arch);
+      const x = new Tensor([1, ...p.arch.inputShape], Float32Array.from({ length: p.arch.inputShape.reduce((a, b) => a * b, 1) }, (_, i) => i % 148));
+      const before = model.forward(x, false).output;
+      const exported = exportModel(model, { kind: "model", metadata: { reasoning: model.reasoningLayers().map((l) => l.info.plan) } });
+      const { model: restored, warnings } = importModel(exported);
+      expect(warnings.length === 0, warnings.join("; "));
+      expect(restored.reasoningLayers().length === 1, "reasoning layer missing after import");
+      const after = restored.forward(x, false).output;
+      let worst = 0;
+      for (let i = 0; i < before.size; i++) worst = Math.max(worst, Math.abs(before.data[i]! - after.data[i]!));
+      expect(worst < 1e-6, `round-trip output differs by ${worst}`);
+      expect((restored.reasoningLayers()[0]!.trace?.stepsUsed ?? 0) === 8, "imported model did not execute its 8 reasoning steps");
+    }),
+  );
+
+  tests.push(
+    run("deep reasoning survives standalone export with an identical trace", () => {
+      const arch: Architecture = {
+        inputShape: [6],
+        inputName: "x",
+        seed: 23,
+        initMethod: "xavier_uniform",
+        layers: [
+          mkDef("dense", { id: "d1", name: "d1", config: { units: 6 } }),
+          mkDef("reasoning_block", { id: "r1", name: "r1", config: { steps: 5, hidden: 8, adaptive: true, haltThreshold: 0.95, minSteps: 2, stepCode: true } }),
+          mkDef("dense", { id: "d2", name: "d2", config: { units: 3 } }),
+        ],
+      };
+      const model = new SequentialModel(arch);
+      const { bundle } = buildStandaloneBundle(model, null, { name: "reason", project: "t", loss: "mse", trained: false });
+      expect(!!bundle.reasoning && bundle.reasoning.layers.length === 1, "bundle does not carry reasoning metadata");
+      expect(bundle.tests.reasoning.length > 0, "no reasoning test vectors");
+      const rep = verifyStandalone(bundle, model, null);
+      const failed = rep.checks.filter((c) => c.status === "fail");
+      expect(rep.ok, failed.map((c) => `${c.label}: ${c.detail}`).join(" | "));
+      const rc = rep.checks.find((c) => c.id === "reasoning");
+      expect(rc?.status === "pass", `reasoning check: ${rc?.status} ${rc?.detail}`);
+      const rt = loadRuntime().createModel(bundle);
+      const tc = bundle.tests.reasoning[0]!;
+      const got = rt.reason(tc.input);
+      expect(got.traces.length === 1 && got.traces[0]!.stepsUsed === tc.traces[0]!.stepsUsed, "exported reason() depth differs");
+      let worst = 0;
+      for (let i = 0; i < got.data.length; i++) worst = Math.max(worst, Math.abs(got.data[i]! - tc.output[i]!));
+      expect(worst < 1e-6, `exported reasoning output differs by ${worst}`);
+    }),
+  );
+
+  tests.push(
     run("attention: export coverage includes the new layers", () => {
       const names = COVERAGE_CASES.map((c) => c.name).join(" | ");
-      expect(/Attention/.test(names) && /Transformer block/.test(names), `coverage cases missing attention: ${names.slice(0, 120)}`);
+      expect(/Attention/.test(names) && /Transformer block/.test(names) && /Deep Reasoning/.test(names), `coverage cases missing attention/reasoning: ${names.slice(0, 160)}`);
     }),
   );
 
@@ -1650,6 +1816,59 @@ export async function runAsyncSelfTests(): Promise<TestResult[]> {
         const cpuLayers = placements.filter((pl) => pl.mode === "cpu").map((pl) => pl.type);
         acc.destroy();
         expect(cpuLayers.includes("transformer_block"), `expected the block on the CPU path, placements: ${placements.map((pl) => pl.type + ":" + pl.mode).join(", ")}`);
+        expect(worstGrad < 1e-6, `gradients differ by ${worstGrad}`);
+        return { name, passed: true, message: `forward and gradients agree (≤ ${Math.max(worstFwd, worstGrad).toExponential(1)}); ${cpuLayers.join(", ")} ran on the CPU`, ms: performance.now() - t0 };
+      } catch (e) {
+        return { name, passed: false, message: e instanceof Error ? e.message : String(e), ms: performance.now() - t0 };
+      }
+    })(),
+  );
+
+  tests.push(
+    await (async () => {
+      const t0 = performance.now();
+      const name = "accelerator: deep reasoning falls back to the CPU and stays exact";
+      try {
+        const arch: Architecture = {
+          inputShape: [6],
+          inputName: "x",
+          seed: 29,
+          initMethod: "xavier_uniform",
+          layers: [
+            makeLayerDef("dense", { id: "d1", name: "d1", config: { units: 6 } }),
+            makeLayerDef("reasoning_block", { id: "r1", name: "r1", config: { steps: 4, hidden: 7, adaptive: false, stepCode: true } }),
+            makeLayerDef("dense", { id: "d2", name: "d2", config: { units: 3 } }),
+          ],
+        };
+        const plain = new SequentialModel(arch);
+        expect(plain.valid, plain.issues[0]?.message ?? "model invalid");
+        const accelerated = new SequentialModel(arch);
+        const acc = new Accelerator(accelerated, ops);
+        const bx = new Tensor([2, 6], Float32Array.from([0.2, -0.4, 0.7, 0.1, -0.3, 0.5, 0.15, -0.6, 0.9, 0.35, -0.25, 0.05]));
+        const dOut = new Tensor([2, 3], [0.2, -0.4, 0.1, -0.3, 0.6, 0.05]);
+        const want = plain.forward(bx, false).output;
+        const got = await acc.runForward(bx, false);
+        let worstFwd = 0;
+        for (let i = 0; i < want.size; i++) worstFwd = Math.max(worstFwd, Math.abs(want.data[i]! - got.data[i]!));
+        expect(worstFwd < 1e-6, `forward differs by ${worstFwd}`);
+        plain.zeroGrads();
+        plain.backward(dOut);
+        accelerated.zeroGrads();
+        await acc.runForward(bx, true);
+        await acc.runBackward(dOut);
+        let worstGrad = 0;
+        for (const layer of plain.layers) {
+          const other = accelerated.layers.find((l) => l.def.id === layer.def.id)!;
+          for (const key of Object.keys(layer.grads)) {
+            const a = layer.grads[key]!.data;
+            const b = other.grads[key]!.data;
+            for (let i = 0; i < a.length; i++) worstGrad = Math.max(worstGrad, Math.abs(a[i]! - b[i]!));
+          }
+        }
+        const placements = acc.placements;
+        const cpuLayers = placements.filter((pl) => pl.mode === "cpu").map((pl) => pl.type);
+        acc.destroy();
+        expect(cpuLayers.includes("reasoning_block"), `expected reasoning on the CPU path, placements: ${placements.map((pl) => pl.type + ":" + pl.mode).join(", ")}`);
         expect(worstGrad < 1e-6, `gradients differ by ${worstGrad}`);
         return { name, passed: true, message: `forward and gradients agree (≤ ${Math.max(worstFwd, worstGrad).toExponential(1)}); ${cpuLayers.join(", ")} ran on the CPU`, ms: performance.now() - t0 };
       } catch (e) {

@@ -5,6 +5,7 @@ import { RNG } from "./rng";
 import { sampleFromProbs } from "./sampling";
 import { tokenizeWords, joinWords } from "../data/corpusLarge";
 import { bpeEncode, bpeDecode } from "../data/bpe";
+import type { ReasoningTrace } from "./reasoning";
 
 /**
  * The single reference implementation of tokenisation + autoregressive
@@ -19,6 +20,18 @@ export interface GenerateOptions {
   seed: number;
   /** Tokens that end generation (not included in the output). */
   stop?: string[];
+  /**
+   * Capture the Deep Reasoning trace of the last forward pass. Reasoning runs
+   * on every token regardless; this only decides whether the per-step halting
+   * diagnostics are returned.
+   */
+  traceReasoning?: boolean;
+}
+
+export interface GenerateReasoningTrace {
+  id: string;
+  name: string;
+  trace: ReasoningTrace | null;
 }
 
 export interface GenerateResult {
@@ -27,6 +40,8 @@ export interface GenerateResult {
   text: string;
   promptIds: number[];
   stoppedBy: string | null;
+  /** Present when the model has Deep Reasoning layers and traceReasoning was requested. */
+  reasoning?: GenerateReasoningTrace[];
 }
 
 function tokenMap(tok: TokenizerSpec): Map<string, number> {
@@ -97,12 +112,14 @@ export function generateTokens(model: SequentialModel, tok: TokenizerSpec, promp
   const ctx = promptIds.slice();
   const ids: number[] = [];
   let stoppedBy: string | null = null;
+  let stepped = false;
 
   for (let t = 0; t < opts.maxTokens; t++) {
     const window = ctx.slice(-seq);
     const filled = window.length < seq ? [...new Array<number>(seq - window.length).fill(padId), ...window] : window;
     const x = new Tensor([1, seq], Float32Array.from(filled));
     const probs = model.forward(x, false).output;
+    stepped = true;
     const { index } = sampleFromProbs(probs.data, opts.temperature, opts.topK, rng);
     const token = tok.tokens[index];
     if (token === undefined) throw new Error(`Model produced class id ${index}, outside the tokenizer's ${tok.tokens.length} tokens.`);
@@ -113,5 +130,10 @@ export function generateTokens(model: SequentialModel, tok: TokenizerSpec, promp
     ids.push(index);
     ctx.push(index);
   }
-  return { ids, tokens: ids.map((i) => tok.tokens[i]!), text: detokenize(tok, ids), promptIds, stoppedBy };
+  const result: GenerateResult = { ids, tokens: ids.map((i) => tok.tokens[i]!), text: detokenize(tok, ids), promptIds, stoppedBy };
+  const reasoningLayers = model.reasoningLayers();
+  if (opts.traceReasoning && stepped && reasoningLayers.length > 0) {
+    result.reasoning = reasoningLayers.map((l) => ({ id: l.id, name: l.name, trace: l.trace }));
+  }
+  return result;
 }

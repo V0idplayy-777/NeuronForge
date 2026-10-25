@@ -40,7 +40,17 @@ function jsExample(b: StandaloneBundle, importPath: string): string {
         `const run = model.generateDetailed("hello there", { maxTokens: 20, seed: 42 });\n` +
         `console.log(run.fullText, run.stoppedBy);\n\n` +
         `// Next-token distribution\n` +
-        `console.log(model.predict("hello there").top.slice(0, 5));\n`
+        `console.log(model.predict("hello there").top.slice(0, 5));\n` +
+        (b.reasoning
+          ? `\n// Deep reasoning: every token above ran ${b.reasoning.defaultSteps} shared-weight deliberation steps.\n` +
+            `// Ask for the per-step halting trace of the final forward pass:\n` +
+            `const traced = model.generateDetailed("q: seven plus eight think:", { maxTokens: 90, seed: 42, traceReasoning: true });\n` +
+            `console.log(traced.fullText);\n` +
+            `console.log(traced.reasoning?.[0]?.halt);  // one halting probability per deliberation step\n\n` +
+            `// Or run one forward pass on a prompt and inspect the trace directly:\n` +
+            `const r = model.reason("q: seven plus eight think:");\n` +
+            `console.log(r.traces[0].stepsUsed, r.traces[0].halt);\n`
+          : "")
       );
     case "binary":
     case "multiclass":
@@ -61,10 +71,17 @@ function jsExample(b: StandaloneBundle, importPath: string): string {
         s += `\n// Images: ImageData, { data, width, height } or a pixel array. Resized to ${b.image.width}x${b.image.height}, scaled to [${b.image.range.join(", ")}].\n// const result = model.predictImage(ctx.getImageData(0, 0, w, h));\n`;
       }
       s += `\n// Batches\nconsole.log(model.predictBatch([${JSON.stringify(round(sample))}]));\n`;
+      if (b.reasoning) {
+        s += `\n// Deep reasoning trace for this input (shared-weight deliberation)\nconst r = model.reason(${JSON.stringify(round(sample))});\nconsole.log(r.traces[0].stepsUsed, r.traces[0].halt);\n`;
+      }
       return s;
     }
     default:
-      return head + `\nconst { shape, data } = model.forward(${JSON.stringify(round(sample))});\nconsole.log(shape, data);\n`;
+      return (
+        head +
+        `\nconst { shape, data } = model.forward(${JSON.stringify(round(sample))});\nconsole.log(shape, data);\n` +
+        (b.reasoning ? `\nconst r = model.reason(${JSON.stringify(round(sample))});\nconsole.log(r.traces[0]);\n` : "")
+      );
   }
 }
 
@@ -75,7 +92,16 @@ function pyExample(b: StandaloneBundle): string {
     return (
       head +
       `\nprint(model.generate("hello there", max_tokens=${b.tokenizer?.level === "char" ? 120 : 40}, temperature=0.7, top_k=50, include_prompt=True))\n` +
-      `print(model.next_token("hello there")["top"][:5])\n`
+      `print(model.next_token("hello there")["top"][:5])\n` +
+      (b.reasoning
+        ? `\n# Deep reasoning: the runtime executes the deliberation loop itself.\n` +
+          `run = model.generate_detailed("q: seven plus eight think:", max_tokens=90, seed=42, trace_reasoning=True)\n` +
+          `print(run["fullText"])\n` +
+          `print(run["reasoning"][0]["stepsUsed"], run["reasoning"][0]["halt"])\n\n` +
+          `# Or one forward pass with the trace, with an optional depth override:\n` +
+          `r = model.reason("q: seven plus eight think:", steps=${b.reasoning.defaultSteps})\n` +
+          `print(r["traces"][0]["halt"])\n`
+        : "")
     );
   }
   if (b.preprocessing && b.tests.preprocessing[0]) {
@@ -83,7 +109,11 @@ function pyExample(b: StandaloneBundle): string {
     for (const c of b.preprocessing.columns) row[c.name] = b.tests.preprocessing[0].raw[c.name] ?? "";
     return head + `\n# Raw table row: encoding + normalisation applied automatically\nprint(model.predict(${JSON.stringify(row)}))\n`;
   }
-  return head + `\nprint(model.predict(${JSON.stringify(round(sample))}))\n`;
+  return (
+    head +
+    `\nprint(model.predict(${JSON.stringify(round(sample))}))\n` +
+    (b.reasoning ? `\nprint(model.reason(${JSON.stringify(round(sample))})["traces"][0]["halt"])\n` : "")
+  );
 }
 
 /* ------------------------------------------------------------------- docs */
@@ -96,6 +126,12 @@ function ioSection(b: StandaloneBundle): string {
   lines.push(`- **Output shape:** \`${JSON.stringify(b.output.shape)}\`${b.output.finalActivation ? `, final activation \`${b.output.finalActivation}\`` : ""}`);
   if (b.output.classNames) lines.push(`- **Classes:** ${b.output.classNames.map((c) => `\`${c}\``).join(", ")}`);
   if (b.output.targetNames) lines.push(`- **Targets:** ${b.output.targetNames.map((c) => `\`${c}\``).join(", ")}`);
+  if (b.reasoning) {
+    const r = b.reasoning;
+    lines.push(
+      `- **Deep reasoning:** ${r.layers.length} layer${r.layers.length > 1 ? "s" : ""}, default depth ${r.layers.map((l) => l.steps).join(" + ")} shared-weight deliberation step${r.layers.length > 1 ? "s" : ""} per forward pass. The runtime executes the loop; \`reason(input, { steps?, adaptive?, haltThreshold? })\` returns the per-step halting, delta and state-norm trace (pass a text prompt for language models).`,
+    );
+  }
   if (b.tokenizer) {
     const t = b.tokenizer;
     lines.push(`- **Tokenizer:** ${t.level}-level, ${t.tokens.length.toLocaleString()} tokens, context ${t.seqLen}, pad token \`${JSON.stringify(t.padToken)}\`${t.eos ? `, end-of-sequence \`${JSON.stringify(t.eos)}\`` : ", no end-of-sequence token"}`);
@@ -122,6 +158,29 @@ function ioSection(b: StandaloneBundle): string {
 
 function limitationsSection(b: StandaloneBundle): string {
   return b.limitations.map((l) => `- ${l}`).join("\n");
+}
+
+function reasoningSample(b: StandaloneBundle): string {
+  if (b.tokenizer) return `"q: seven plus eight think:"`;
+  return JSON.stringify(round(b.tests.reasoning[0]?.input ?? b.tests.forward[0]?.input ?? []));
+}
+
+function reasoningReadmeSection(b: StandaloneBundle): string {
+  if (!b.reasoning) return "";
+  const layers = b.reasoning.layers;
+  const depth = layers.map((l) => l.steps).join(" + ");
+  return `## Deep reasoning
+
+This export contains **${layers.length} Deep Reasoning block${layers.length > 1 ? "s" : ""}** with a default depth of **${depth}** shared-weight deliberation step${b.reasoning.defaultSteps === 1 ? "" : "s"}. The loop is part of the runtime, not a description: every forward pass iterates the same learned thought cell and applies its learned halting head. The weights, step code and halting parameters are included in the bundle like every other tensor.
+
+\`\`\`js
+const r = model.reason(${reasoningSample(b)}, { steps: ${b.reasoning.defaultSteps} });
+console.log(r.traces[0].stepsUsed, r.traces[0].halt);   // per-step halting probabilities
+\`\`\`
+
+\`steps\` may be raised to spend more compute at inference (depth is extrapolation beyond the trained value) or lowered to save time; \`adaptive: false\` forces the full depth, and \`haltThreshold\` controls early stopping. The output is still produced by the exported weights — the runtime cannot call a remote model.
+
+`;
 }
 
 function jsReadme(b: StandaloneBundle, pkg: string): string {
@@ -163,7 +222,7 @@ ${ioSection(b)}
 - \`model.predict(input, { preprocessed? })\` → task-aware result (\`predicted\`, \`label\`, \`probability\`/\`probabilities\`, \`value\`, \`reconstruction\`, \`top\`, \`raw\` …)
 - \`model.predictBatch(inputs)\`
 - \`model.forward(values, batchSize)\` → \`{ shape, data: Float32Array }\` raw network output
-${b.preprocessing ? "- `model.encode(rawRow)` → the encoded feature vector\n" : ""}${b.tokenizer ? "- `model.tokenize(text)`, `model.detokenize(ids)`, `model.nextToken(text)`\n- `model.generate(prompt, { maxTokens, temperature = 0.7, topK = 50, seed, stop, stopAtEos, includePrompt })`\n- `model.generateDetailed(prompt, options)` → `{ text, fullText, ids, tokens, stoppedBy, settings }`\n" : ""}${b.image ? "- `model.predictImage(imageDataOrPixels, { scale, invert })`, `model.imageToInput(...)`\n" : ""}- \`model.verify()\` → \`{ ok, checks }\`
+${b.preprocessing ? "- `model.encode(rawRow)` → the encoded feature vector\n" : ""}${b.tokenizer ? "- `model.tokenize(text)`, `model.detokenize(ids)`, `model.nextToken(text)`\n- `model.generate(prompt, { maxTokens, temperature = 0.7, topK = 50, seed, stop, stopAtEos, includePrompt })`\n- `model.generateDetailed(prompt, { ..., traceReasoning })` → `{ text, fullText, ids, tokens, stoppedBy, settings, reasoning? }`\n" : ""}${b.reasoning ? "- `model.reason(input, { steps?, adaptive?, haltThreshold? })` → `{ shape, data, traces }`, where each trace has `stepsUsed`, `halt`, `cumulativeHalt`, `deltaNorm`, `stateNorm`, `changeNorm`\n- `model.getReasoning()` → the traces from the most recent forward pass\n" : ""}${b.image ? "- `model.predictImage(imageDataOrPixels, { scale, invert })`, `model.imageToInput(...)`\n" : ""}- \`model.verify()\` → \`{ ok, checks }\`
 - \`model.info\`, \`model.getWeights()\`
 
 ## Numerical behaviour
@@ -172,7 +231,7 @@ The runtime mirrors NeuronForge's engine operation for operation: float32 storag
 
 On load the runtime validates every layer type, recomputes every tensor shape, checks each weight's shape and checksum (bound to its layer), and rejects unused tensors. Unsupported or corrupted bundles throw descriptive errors instead of producing wrong numbers.
 
-## What this export does not include
+${reasoningReadmeSection(b)}## What this export does not include
 
 ${limitationsSection(b)}
 `;
@@ -189,7 +248,9 @@ Exported from NeuronForge on ${b.exportedAt}. Runs the trained model without Neu
 pip install -r requirements.txt   # numpy
 python neuronforge_model.py --verify
 python neuronforge_model.py --info
-${b.task === "language" ? 'python neuronforge_model.py --generate "hello there" --max-tokens 40 --temperature 0.7 --top-k 50' : `python neuronforge_model.py --predict ${round(b.tests.forward[0]?.input ?? []).join(",")}`}
+${b.task === "language" ? 'python neuronforge_model.py --generate "hello there" --max-tokens 40 --temperature 0.7 --top-k 50' : `python neuronforge_model.py --predict ${round(b.tests.forward[0]?.input ?? []).join(",")}`}${b.reasoning ? (b.tokenizer ? `
+python neuronforge_model.py --reason-prompt "q: seven plus eight think:" --reason-steps ${b.reasoning.defaultSteps}` : `
+python neuronforge_model.py --reason=${round(b.tests.reasoning[0]?.input ?? []).join(",")} --reason-steps ${b.reasoning.defaultSteps}`) : ""}
 \`\`\`
 
 ## Usage
@@ -207,7 +268,18 @@ ${ioSection(b)}
 
 **This Python runtime was generated, not executed, by NeuronForge** — the browser cannot run Python. Run \`--verify\` before relying on it.
 
-## What this export does not include
+${b.reasoning ? `## Deep reasoning
+
+This export contains **${b.reasoning.layers.length} Deep Reasoning block${b.reasoning.layers.length > 1 ? "s" : ""}** (default depth ${b.reasoning.layers.map((l) => l.steps).join(" + ")}). \`reason()\` runs the same shared-weight deliberation loop as the browser model and returns the per-step halting trace:
+
+\`\`\`python
+r = model.reason(${b.tokenizer ? '"q: seven plus eight think:"' : JSON.stringify(round(b.tests.reasoning[0]?.input ?? b.tests.forward[0]?.input ?? []))})
+print(r["traces"][0]["stepsUsed"], r["traces"][0]["halt"])
+\`\`\`
+
+Pass \`steps=...\`, \`adaptive=False\` or \`halt_threshold=...\` to override the exported plan for one call. \`generate_detailed(..., trace_reasoning=True)\` attaches the final-token trace to generated text.
+
+` : ""}## What this export does not include
 
 ${limitationsSection(b)}
 `;
@@ -241,6 +313,34 @@ export interface GenerateOptions {
   stop?: string[];
   stopAtEos?: boolean;
   includePrompt?: boolean;
+  /** Include the final forward pass's Deep Reasoning trace in the result. */
+  traceReasoning?: boolean;
+}
+
+export interface ReasoningTrace {
+  layerId: string;
+  name: string;
+  steps: number;
+  stepsUsed: number;
+  halted: boolean;
+  halt: number[];
+  cumulativeHalt: number[];
+  deltaNorm: number[];
+  stateNorm: number[];
+  changeNorm: number[];
+}
+
+export interface ReasoningResult {
+  shape: number[];
+  data: Float32Array;
+  traces: ReasoningTrace[];
+}
+
+export interface ReasonOptions {
+  batch?: number;
+  steps?: number;
+  adaptive?: boolean;
+  haltThreshold?: number;
 }
 
 export interface GenerationResult {
@@ -251,6 +351,8 @@ export interface GenerationResult {
   promptIds: number[];
   stoppedBy: string | null;
   settings: { maxTokens: number; temperature: number; topK: number; seed: number; stop: string[] };
+  /** Present for Deep Reasoning models when traceReasoning was requested. */
+  reasoning?: ReasoningTrace[];
 }
 
 export interface VerifyReport {
@@ -273,6 +375,14 @@ export interface ModelInfo {
   preprocessing: { kind: "tabular"; columns: string[]; normalize: string; missing: string } | null;
   image: { height: number; width: number; channels: number; layout: "HWC"; range: [number, number]; description: string } | null;
   sampling: { temperature: number; topK: number };
+  reasoning: {
+    present: true;
+    layers: { id: string; name: string; steps: number; hidden: number; adaptive: boolean; haltThreshold: number; minSteps: number; stepCode: boolean; stepCodeScale: number; activation: string }[];
+    defaultSteps: number;
+    adjustableSteps: true;
+    runtimeApi: string;
+    description: string;
+  } | null;
   runtimeVersion: string;
   exportedAt: string;
   limitations: string[];
@@ -291,6 +401,10 @@ export interface NeuronForgeModel {
   nextToken(text: string): PredictionResult;
   generate(prompt: string, options?: GenerateOptions): string;
   generateDetailed(prompt: string, options?: GenerateOptions): GenerationResult;
+  /** Run one forward pass through the exported Deep Reasoning loop and return its trace. */
+  reason(input: string | ArrayLike<number> | number[], options?: ReasonOptions): ReasoningResult;
+  /** Traces from the most recent forward pass. */
+  getReasoning(): ReasoningTrace[];
   imageToInput(image: ImageInput, options?: { scale?: number; invert?: boolean }): number[];
   predictImage(image: ImageInput, options?: { scale?: number; invert?: boolean }): PredictionResult;
   verify(): VerifyReport;

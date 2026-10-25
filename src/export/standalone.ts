@@ -13,12 +13,12 @@ export { RUNTIME_JS, RUNTIME_PY };
 
 export const STANDALONE_FORMAT = "neuronforge-standalone";
 export const STANDALONE_VERSION = 1;
-export const STANDALONE_RUNTIME_VERSION = "1.3.0";
+export const STANDALONE_RUNTIME_VERSION = "1.4.0";
 
 /** Every layer type the builder can produce. Anything else is reported as unsupported. */
 export const SUPPORTED_LAYER_TYPES: LayerType[] = [
   "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-  "gap2d", "embedding", "attention", "transformer_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+  "gap2d", "embedding", "attention", "transformer_block", "reasoning_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
   "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 ];
 const FUSABLE = ["none", "linear", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
@@ -39,12 +39,56 @@ export interface BundleLayer {
   outputShape: number[];
 }
 
+export interface BundleReasoningLayer {
+  id: string;
+  name: string;
+  steps: number;
+  hidden: number;
+  adaptive: boolean;
+  haltThreshold: number;
+  minSteps: number;
+  stepCode: boolean;
+  stepCodeScale: number;
+  activation: string;
+}
+
+export interface BundleReasoning {
+  /** Deep reasoning is part of the exported artifact, not described only in its documentation. */
+  present: true;
+  layers: BundleReasoningLayer[];
+  defaultSteps: number;
+  /** The per-forward-pass depth can be overridden at inference, within the runtime's guard rails. */
+  adjustableSteps: true;
+  runtimeApi: string;
+  description: string;
+}
+
+export interface BundleReasoningTrace {
+  layerId: string;
+  name: string;
+  steps: number;
+  stepsUsed: number;
+  halted: boolean;
+  halt: number[];
+  cumulativeHalt: number[];
+  deltaNorm: number[];
+  stateNorm: number[];
+  changeNorm: number[];
+}
+
+export interface BundleReasoningTest {
+  input: number[];
+  output: number[];
+  traces: BundleReasoningTrace[];
+}
+
 export interface BundleTests {
   tolerance: { atol: number; rtol: number };
   forward: { input: number[]; output: number[] }[];
   tokenizer: { text: string; ids: number[] }[];
   generation: { prompt: string; maxTokens: number; temperature: number; topK: number; seed: number; ids: number[]; text: string }[];
   preprocessing: TabularPreprocessing["samples"];
+  reasoning: BundleReasoningTest[];
 }
 
 export interface StandaloneBundle {
@@ -62,8 +106,9 @@ export interface StandaloneBundle {
   image: ImageSpec | null;
   tokenizer: BundleTokenizer | null;
   sampling: { temperature: number; topK: number };
+  reasoning: BundleReasoning | null;
   provenance: { project: string; dataset: string | null; loss: LossName; trainedThisSession: boolean; paramCount: number };
-  includes: { inference: true; training: false; optimizerState: false; dataset: boolean };
+  includes: { inference: true; training: false; optimizerState: false; dataset: boolean; reasoning: boolean };
   limitations: string[];
   tests: BundleTests;
 }
@@ -88,6 +133,12 @@ export interface ExportAnalysis {
   perLayer: LayerSupport[];
   paramCount: number;
   approxBundleBytes: number;
+  reasoning: {
+    layers: number;
+    defaultSteps: number;
+    totalStepsPerForward: number;
+    note: string;
+  } | null;
 }
 
 export interface ExportOptions {
@@ -200,6 +251,15 @@ export function analyzeExport(model: SequentialModel, dataset: PreparedDataset |
       io.push(`Input: ${numel(inShape)} values shaped ${JSON.stringify(inShape)}. Output: raw tensor ${JSON.stringify(model.valid ? model.outputShape : [])}.`);
   }
 
+  const reasoningLayersAll = model.reasoningLayers();
+  if (reasoningLayersAll.length > 0) {
+    const steps = reasoningLayersAll.map((l) => l.info.plan.steps);
+    io.push(
+      `Deep reasoning: ${reasoningLayersAll.length} reasoning block${reasoningLayersAll.length > 1 ? "s" : ""} run${reasoningLayersAll.length > 1 ? "" : "s"} ` +
+        `${steps.join(" + ")} shared-weight deliberation step(s) per forward pass (${steps.reduce((a, b) => a + b, 0)} total). ` +
+        "model.reason(input) returns the per-step halting / update trace, and generation runs the same loop for every token.",
+    );
+  }
   if (!dataset) limitations.push("No dataset context: exported as a raw tensor model.");
   else if (!datasetCompatible) {
     limitations.push(
@@ -219,12 +279,22 @@ export function analyzeExport(model: SequentialModel, dataset: PreparedDataset |
   }
   if (task === "language") {
     if (tok!.level === "word") {
+      const oov = tok!.oovRate ?? 0;
       limitations.push(
-        `Word vocabulary is frequency-capped (${((tok!.oovRate ?? 0) * 100).toFixed(1)}% of corpus tokens were <unk>). There is no dedicated end-of-sequence token; pass stop: ["."] to end at a sentence boundary.`,
+        oov > 0
+          ? `Word vocabulary is frequency-capped (${(oov * 100).toFixed(1)}% of corpus tokens were <unk>). There is no dedicated end-of-sequence token; pass stop: ["."] to end at a sentence boundary.`
+          : `Word-level vocabulary covers every word in the training corpus (0.0% <unk>). There is no dedicated end-of-sequence token; pass stop: ["."] to end at a sentence boundary.`,
       );
     } else {
       limitations.push('Newline ("\\n") is treated as end-of-sequence by default (stopAtEos). Pass stop: [] to disable.');
     }
+  }
+  const reasoningLayers = model.reasoningLayers();
+  if (reasoningLayers.length > 0) {
+    const steps = reasoningLayers.map((l) => l.info.plan.steps).reduce((a, b) => a + b, 0);
+    limitations.push(
+      `Deep reasoning is preserved in the runtime: every forward pass executes ${steps} real deliberation steps through the shared reasoning weights, and model.reason() exposes the halting trace. It is iterative latent computation, not a symbolic proof engine — the model can only reason as well as its training distribution allows.`,
+    );
   }
   limitations.push("Inference only: the export cannot train, fine-tune, or compute gradients, and contains no optimiser state. Use “Download checkpoint” to resume training inside NeuronForge.");
   limitations.push("BatchNorm uses its running statistics and Dropout is disabled, matching NeuronForge's evaluation behaviour.");
@@ -234,6 +304,15 @@ export function analyzeExport(model: SequentialModel, dataset: PreparedDataset |
 
   const pc = model.valid ? model.paramCount() : { trainable: 0, nonTrainable: 0 };
   const paramCount = pc.trainable + pc.nonTrainable;
+  const reasoning =
+    reasoningLayers.length > 0
+      ? {
+          layers: reasoningLayers.length,
+          defaultSteps: reasoningLayers[0]!.info.plan.steps,
+          totalStepsPerForward: reasoningLayers.reduce((a, l) => a + l.info.plan.steps, 0),
+          note: "The exported runtime keeps the deliberation loop and can override its depth at inference.",
+        }
+      : null;
   return {
     task,
     taskReason,
@@ -245,6 +324,7 @@ export function analyzeExport(model: SequentialModel, dataset: PreparedDataset |
     perLayer,
     paramCount,
     approxBundleBytes: Math.round(paramCount * 4 * 1.34 + 20000),
+    reasoning,
   };
 }
 
@@ -367,7 +447,31 @@ export function buildStandaloneBundle(
   if (meta?.classNames && (analysis.task === "binary" || analysis.task === "multiclass")) output.classNames = meta.classNames.slice();
   if (meta?.targetNames && analysis.task === "regression") output.targetNames = meta.targetNames.slice();
 
-  const tests: BundleTests = { tolerance: { atol: 1e-5, rtol: 1e-4 }, forward: [], tokenizer: [], generation: [], preprocessing: [] };
+  const tests: BundleTests = { tolerance: { atol: 1e-5, rtol: 1e-4 }, forward: [], tokenizer: [], generation: [], preprocessing: [], reasoning: [] };
+  const modelReasoning = model.reasoningLayers();
+  const reasoning: BundleReasoning | null =
+    modelReasoning.length > 0
+      ? {
+          present: true,
+          layers: modelReasoning.map((l) => ({
+            id: l.id,
+            name: l.name,
+            steps: l.info.plan.steps,
+            hidden: l.info.plan.hidden,
+            adaptive: l.info.plan.adaptive,
+            haltThreshold: l.info.plan.haltThreshold,
+            minSteps: l.info.plan.minSteps,
+            stepCode: l.info.plan.stepCode,
+            stepCodeScale: l.info.plan.stepCodeScale,
+            activation: l.info.plan.activation,
+          })),
+          defaultSteps: modelReasoning[0]!.info.plan.steps,
+          adjustableSteps: true,
+          runtimeApi: "model.reason(input, { steps?, adaptive?, haltThreshold? }) -> { shape, data, traces }",
+          description:
+            "The exported runtime executes the same shared-weight deliberation loop as NeuronForge: each forward pass runs the configured number of reasoning steps, applies the learned halting head, and can expose the per-step trace. The reasoning weights are included in the bundle like every other tensor.",
+        }
+      : null;
   if (opts.includeTests !== false) {
     const outSize = numel(model.outputShape);
     const inputs = makeInputs(model, dataset, analysis.datasetCompatible, outSize > 512 ? 3 : 6, new RNG(1234));
@@ -386,6 +490,35 @@ export function buildStandaloneBundle(
       }
     }
     if (meta?.preprocessing && preprocessing) tests.preprocessing = structuredClone(meta.preprocessing.samples);
+    if (reasoning) {
+      // Per-input (batch 1) traces: the runtime's reason() runs one row at a
+      // time, and adaptive halting is a batch-mean decision. Capturing these
+      // individually makes the exported trace comparable operation for operation.
+      const inputs1 = inputs.slice(0, 3);
+      for (const input of inputs1) {
+        const x = new Tensor([1, ...model.arch.inputShape], Float32Array.from(input));
+        const y = model.forward(x, false).output;
+        tests.reasoning.push({
+          input: input.slice(),
+          output: Array.from(y.data),
+          traces: model.reasoningLayers().map((l) => {
+            const t = l.trace;
+            return {
+              layerId: l.id,
+              name: l.name,
+              steps: t?.steps ?? l.info.plan.steps,
+              stepsUsed: t?.stepsUsed ?? 0,
+              halted: t?.halted ?? false,
+              halt: t?.halt ? Array.from(t.halt) : [],
+              cumulativeHalt: t?.cumulativeHalt ? Array.from(t.cumulativeHalt) : [],
+              deltaNorm: t?.deltaNorm ? Array.from(t.deltaNorm) : [],
+              stateNorm: t?.stateNorm ? Array.from(t.stateNorm) : [],
+              changeNorm: t?.changeNorm ? Array.from(t.changeNorm) : [],
+            };
+          }),
+        });
+      }
+    }
   }
 
   const limitations = analysis.limitations.slice();
@@ -406,8 +539,9 @@ export function buildStandaloneBundle(
     image,
     tokenizer,
     sampling: { temperature: 0.7, topK: 50 },
+    reasoning,
     provenance: { project: opts.project, dataset: meta?.name ?? null, loss: opts.loss, trainedThisSession: opts.trained, paramCount: analysis.paramCount },
-    includes: { inference: true, training: false, optimizerState: false, dataset: !!opts.includeDataset },
+    includes: { inference: true, training: false, optimizerState: false, dataset: !!opts.includeDataset, reasoning: !!reasoning },
     limitations,
     tests,
   };
@@ -416,14 +550,34 @@ export function buildStandaloneBundle(
 
 /* ---------------------------------------------------------------- runtime */
 
+export interface RuntimeReasoningTrace {
+  layerId: string;
+  name: string;
+  steps: number;
+  stepsUsed: number;
+  halted: boolean;
+  halt: number[];
+  cumulativeHalt: number[];
+  deltaNorm: number[];
+  stateNorm: number[];
+  changeNorm: number[];
+}
+
+export interface RuntimeReasoningResult {
+  shape: number[];
+  data: Float32Array;
+  traces: RuntimeReasoningTrace[];
+}
+
 export interface RuntimeModel {
-  info: { layers: { name: string; type: string; outputShape: number[] }[]; outputShape: number[]; paramCount: number };
+  info: { layers: { name: string; type: string; outputShape: number[] }[]; outputShape: number[]; paramCount: number; reasoning?: unknown };
   forward(input: ArrayLike<number> | number[], batch?: number): { shape: number[]; data: Float32Array };
   predict(input: unknown, opts?: { preprocessed?: boolean }): Record<string, unknown>;
   encode(row: unknown): number[];
   tokenize(text: string): number[];
   detokenize(ids: number[]): string;
-  generateDetailed(prompt: string, o: Record<string, unknown>): { ids: number[]; text: string };
+  generateDetailed(prompt: string, o: Record<string, unknown>): { ids: number[]; text: string; reasoning?: RuntimeReasoningTrace[] };
+  reason(input: string | ArrayLike<number> | number[], options?: { batch?: number; steps?: number; adaptive?: boolean; haltThreshold?: number }): RuntimeReasoningResult;
   verify(): { ok: boolean; checks: { name: string; status: string; detail: string }[] };
   getWeights(): Record<string, Float32Array>;
 }
@@ -540,6 +694,22 @@ export const COVERAGE_CASES: CoverageCase[] = [
       { type: "transformer_block", config: { heads: 2, dModel: 8, ffDim: 12, causal: true, pool: "last", activation: "gelu" } },
       { type: "dense", config: { units: 5 } },
       { type: "softmax" },
+    ],
+  },
+  {
+    name: "Deep Reasoning (adaptive depth, step code)",
+    inputShape: [6],
+    layers: [
+      { type: "dense", config: { units: 6 } },
+      { type: "reasoning_block", config: { steps: 5, hidden: 7, adaptive: true, haltThreshold: 0.9, minSteps: 2, activation: "gelu", stepCode: true } },
+    ],
+  },
+  {
+    name: "Deep Reasoning (fixed depth, no step code, tanh)",
+    inputShape: [5],
+    layers: [
+      { type: "dense", config: { units: 5 } },
+      { type: "reasoning_block", config: { steps: 3, hidden: 4, adaptive: false, activation: "tanh", stepCode: false } },
     ],
   },
   { name: "Embedding (rounding + clamping)", inputShape: [5], vocab: 7, layers: [{ type: "embedding", config: { vocabSize: 7, embeddingDim: 3 } }, { type: "flatten" }, { type: "dense", config: { units: 2 } }] },
@@ -771,6 +941,62 @@ export function verifyStandalone(bundle: StandaloneBundle, model: SequentialMode
       status: gitems.every((i) => i.ok) ? "pass" : "fail",
       detail: gitems.every((i) => i.ok) ? `${gitems.length} seeded generations produce identical tokens.` : "Generation diverged from NeuronForge.",
       items: gitems,
+    });
+  }
+
+  // 6b. deep reasoning traces (the exported model must still think, not just carry the weights)
+  if (bundle.reasoning) {
+    const items = bundle.tests.reasoning.map((tc, i) => {
+      try {
+        const got = rtm.reason(tc.input);
+        const out = compare(got.data, tc.output, 1e-6, 1e-6);
+        let traceOk = got.traces.length === tc.traces.length;
+        let worst = 0;
+        let traceDetail = `${got.traces.length}/${tc.traces.length} reasoning layer traces`;
+        for (let k = 0; k < Math.min(got.traces.length, tc.traces.length); k++) {
+          const a = got.traces[k]!;
+          const b = tc.traces[k]!;
+          if (a.layerId !== b.layerId || a.stepsUsed !== b.stepsUsed || a.halted !== b.halted) traceOk = false;
+          for (const key of ["halt", "cumulativeHalt", "deltaNorm", "stateNorm", "changeNorm"] as const) {
+            const x = a[key];
+            const y = b[key];
+            if (!x || !y || x.length !== y.length) {
+              traceOk = false;
+              continue;
+            }
+            for (let j = 0; j < x.length; j++) {
+              const d = Math.abs(x[j]! - y[j]!);
+              if (!(d <= 1e-5 + 1e-4 * Math.abs(y[j]!))) traceOk = false;
+              if (d > worst) worst = d;
+            }
+          }
+          traceDetail = `depth ${a.stepsUsed}/${a.steps}, halted ${a.halted}, worst trace |Δ| ${worst.toExponential(1)}`;
+        }
+        return {
+          label: `reasoning vector #${i + 1}`,
+          ok: out.bad === 0 && traceOk,
+          detail: out.bad === 0
+            ? traceOk
+              ? traceDetail
+              : `trace diverged: ${traceDetail}`
+            : `${out.bad} output values outside 1e-6 (max |Δ| ${out.maxAbs.toExponential(1)})`,
+        };
+      } catch (e) {
+        return { label: `reasoning vector #${i + 1}`, ok: false, detail: e instanceof Error ? e.message : String(e) };
+      }
+    });
+    const layerText = `${bundle.reasoning.layers.length} block${bundle.reasoning.layers.length > 1 ? "s" : ""} · ${bundle.reasoning.layers.map((l) => l.steps).join(" + ")} steps`;
+    checks.push({
+      id: "reasoning",
+      label: `Deep reasoning preserved (${layerText})`,
+      status: items.length === 0 ? "warn" : items.every((i) => i.ok) ? "pass" : "fail",
+      detail:
+        items.length === 0
+          ? "Bundle records reasoning layers, but test vectors were not requested."
+          : items.every((i) => i.ok)
+            ? `${items.length} reasoning vectors reproduce the engine's output and per-step halting trace. The runtime really executes the deliberation loop.`
+            : "The exported runtime did not reproduce the reasoning trace.",
+      items,
     });
   }
 

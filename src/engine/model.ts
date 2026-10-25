@@ -5,6 +5,7 @@ import { RNG } from "./rng";
 import { compileLayer, inferOutputShape, makeLayerDef } from "./layers";
 import type { CompiledLayer } from "./layers";
 import type { InitMethod, LayerType } from "./types";
+import type { ReasoningLayerInfo, ReasoningTrace } from "./reasoning";
 
 export interface ForwardResult {
   output: Tensor;
@@ -107,7 +108,13 @@ export class SequentialModel {
       const outputFloats = numel(l.outputShape) * batchSize;
       activationFloats += outputFloats * 3;
 
-      if (type === "attention" || type === "transformer_block") {
+      if (type === "reasoning_block") {
+        const width = Math.max(1, shape[shape.length - 1] ?? 1);
+        const hidden = Math.max(1, Number(config.hidden) > 0 ? Number(config.hidden) : width * 2);
+        const steps = Math.max(1, Math.min(64, Number(config.steps) || 8));
+        // Every step caches u, pre-activation, activation, delta and gates for backprop.
+        activationFloats += batchSize * steps * (width * 6 + hidden * 3 + 8);
+      } else if (type === "attention" || type === "transformer_block") {
         const sequenceLength = shape.length >= 2 ? shape[shape.length - 2]! : 1;
         const heads = Math.max(1, Number(config.heads) || 1);
         // Scores, probabilities and their backward workspace; a practical
@@ -242,6 +249,17 @@ export class SequentialModel {
       hist: histogram(t),
     }));
     return { layer, params };
+  }
+
+  /**
+   * Deep-reasoning layers in this model, with the trace of the most recent
+   * forward pass. Empty for models without a reasoning block. The standalone
+   * exporter and the exported runtimes expose the same trace.
+   */
+  reasoningLayers(): { id: string; name: string; info: ReasoningLayerInfo; trace: ReasoningTrace | null }[] {
+    return this.layers
+      .filter((l) => !!l.reasoning)
+      .map((l) => ({ id: l.def.id, name: l.def.name, info: l.reasoning!, trace: l.reasoning!.trace }));
   }
 
   clone(): SequentialModel {

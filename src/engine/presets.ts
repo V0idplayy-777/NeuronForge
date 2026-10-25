@@ -8,11 +8,12 @@ import { LM2_SEQ_LEN } from "../data/corpusLarge";
 import { NOVA_SEQ_LEN, NOVA_VOCAB_TARGET } from "../data/corpusChat";
 import { PY_SEQ_LEN, PY_VOCAB_TARGET } from "../data/corpusCode";
 import { SEQ_WINDOW } from "../data/datasets";
+import { REASON_SEQ_LEN, REASON_VOCAB_TARGET } from "../data/corpusReason";
 
 export interface Preset {
   id: string;
   name: string;
-  category: "Classification" | "Regression" | "Vision" | "Autoencoder" | "Text" | "Sequence" | "Code";
+  category: "Classification" | "Regression" | "Vision" | "Autoencoder" | "Text" | "Sequence" | "Code" | "Reasoning";
   description: string;
   datasetHint: string;
   arch: Architecture;
@@ -773,6 +774,29 @@ export const PRESETS: Preset[] = [
     ]),
   },
 
+  /* ---------------- Reasoning ---------------- */
+  {
+    id: "deep-reasoner-40k",
+    name: "Deep Reasoner · 40k (deep reasoning)",
+    category: "Reasoning",
+    description: `The deep-reasoning preset, sized at ~40,000 parameters. Word-level Embedding(50) → LSTM(50) carries the question and the partial trace → **Deep Reasoning block** (8 shared-weight deliberation steps, 46-wide thought cell, learned halting gate, fixed depth by default) → softmax over the corpus's ${REASON_VOCAB_TARGET}-word vocabulary. The ${REASON_SEQ_LEN}-word context holds a complete question → thought → answer example.
+
+The Deep Reasoning block is what makes this model different: instead of spending more parameters on a deeper feed-forward stack, it iterates one shared thought cell over a latent state — LayerNorm → sinusoidal step code → GELU MLP → gated residual write — with a learned halting head. Depth is a runtime parameter, so the same 40k weights can think for 8 steps in training and for more (or fewer) at inference; the preset runs a fixed depth so training and generation see the same computation, and adaptive early exit remains one switch away. The exported runtimes keep the loop and expose the per-step halting trace.
+
+The training corpus is explicit chain-of-thought: prompt with "q: ... think:" and the model continues with the intermediate steps before "a: ...". It is a small synthetic corpus (arithmetic, counting, comparison, ordering, syllogisms, sequences), not a general reasoner — it learns the trace format and those patterns, and will not generalise to arbitrary maths or open-domain questions. Every example is computed correctly at build time, and the dataset is word-level so there are no unknown tokens and every trace fits one window. The preset loader sets a three-epoch smoke test; train longer for better trace fidelity.`,
+    datasetHint: "reason_traces",
+    arch: arch([REASON_SEQ_LEN], [
+      makeLayerDef("embedding", { name: "embed", config: { vocabSize: REASON_VOCAB_TARGET, embeddingDim: 50 } }),
+      makeLayerDef("lstm", { name: "context", config: { units: 50, returnSequences: false, forgetBias: 1 } }),
+      makeLayerDef("reasoning_block", {
+        name: "deliberate",
+        config: { steps: 8, hidden: 46, activation: "gelu", adaptive: false, haltThreshold: 0.99, minSteps: 2, stepCode: true, stepCodeScale: 1, epsilon: 1e-5 },
+      }),
+      dense(REASON_VOCAB_TARGET, "logits"),
+      act("softmax"),
+    ], 42, "xavier_normal"),
+  },
+
   /* ---------------- Sequence ---------------- */
   {
     id: "seq-rnn",
@@ -917,7 +941,7 @@ export function alignToVocab(a: Architecture, vocabSize: number, seqLen: number)
   return copy;
 }
 
-export const PRESET_CATEGORIES: Preset["category"][] = ["Classification", "Regression", "Vision", "Autoencoder", "Text", "Sequence", "Code"];
+export const PRESET_CATEGORIES: Preset["category"][] = ["Classification", "Regression", "Vision", "Autoencoder", "Text", "Code", "Reasoning", "Sequence"];
 
 export function presetById(id: string): Preset | undefined {
   return PRESETS.find((p) => p.id === id);

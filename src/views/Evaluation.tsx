@@ -7,7 +7,7 @@ import { classificationFromPred, regressionFromPred } from "../engine/metrics";
 import { Confusion } from "../components/Charts";
 import { fmt, fmtShape } from "../lib/format";
 import { SAMPLING_DOCS } from "../engine/sampling";
-import { generateTokens } from "../engine/generate";
+import { generateTokens, type GenerateReasoningTrace } from "../engine/generate";
 
 const COLORS = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f43f5e"];
 
@@ -24,9 +24,11 @@ export function Evaluation() {
       ? "q: hello there a:"
       : s.dataset.meta.id === "python_code"
         ? "# reverse a list"
-        : "hello there",
+        : s.dataset.meta.id === "reason_traces"
+          ? "q: seven plus eight think:"
+          : "hello there",
   );
-  const [gen, setGen] = useState("");
+  const [gen, setGen] = useState<{ text: string; reasoning?: GenerateReasoningTrace[] } | null>(null);
   const [temperature, setTemperature] = useState(0.7);
   const [topK, setTopK] = useState(50);
   const [genLen, setGenLen] = useState(60);
@@ -170,7 +172,35 @@ export function Evaluation() {
                 {temperature <= 0.01 ? "greedy argmax" : `sampling · T=${temperature} · k=${Math.min(topK, s.model.outputShape[s.model.outputShape.length - 1] || topK)}`}
               </span>
             </div>
-            {gen && <pre className="text-xs text-cyan-100 whitespace-pre-wrap bg-black/40 p-2 rounded-md leading-relaxed">{gen}</pre>}
+            {gen && <pre className="text-xs text-cyan-100 whitespace-pre-wrap bg-black/40 p-2 rounded-md leading-relaxed">{gen.text}</pre>}
+            {gen?.reasoning?.map((r) => {
+              const t = r.trace;
+              if (!t) return null;
+              return (
+                <div key={r.id} className="rounded-md border border-orange-400/30 bg-orange-500/5 px-3 py-2">
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-orange-100">
+                    <span className="font-medium">Deep reasoning · {r.name}</span>
+                    <span className="font-mono text-slate-400">
+                      {t.stepsUsed}/{t.steps} steps{t.halted ? " · halted early" : " · full depth"}
+                    </span>
+                    <span className="font-mono text-slate-400">
+                      cumulative halt {(t.cumulativeHalt[t.cumulativeHalt.length - 1] ?? 0).toFixed(3)}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex items-end gap-1 h-12">
+                    {t.halt.map((h, i) => (
+                      <div key={i} className="flex-1 flex flex-col items-center justify-end h-full" title={`step ${i + 1}: halt ${h.toFixed(3)}, Δnorm ${t.deltaNorm[i]?.toFixed(3)}`}>
+                        <div className="w-full bg-orange-400/70 rounded-sm" style={{ height: `${Math.max(3, h * 100)}%` }} />
+                        <span className="text-[9px] text-slate-500 font-mono">{i + 1}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    Bar height = halting probability per deliberation step. This is the final forward pass (the last generated token); every token ran the same loop.
+                  </p>
+                </div>
+              );
+            })}
           </div>
         ) : (
           <div className="space-y-2">
@@ -343,9 +373,10 @@ function generateText(
   temperature: number,
   topK: number,
   seed: number,
-): string {
+): { text: string; reasoning?: GenerateReasoningTrace[] } {
   const tok = s.dataset.meta.tokenizer;
   if (!tok) throw new Error("This dataset has no tokenizer attached. Select a language dataset.");
   // Same function the standalone exporter verifies the exported runtime against.
-  return generateTokens(s.model, tok, prompt, { maxTokens: n, temperature, topK, seed, stop: [] }).text;
+  const r = generateTokens(s.model, tok, prompt, { maxTokens: n, temperature, topK, seed, stop: [], traceReasoning: true });
+  return { text: r.text, reasoning: r.reasoning };
 }

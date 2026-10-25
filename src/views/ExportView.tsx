@@ -15,7 +15,26 @@ export function ExportView() {
   const doExport = (kind: "model" | "checkpoint") => {
     const exported = exportModel(s.model, {
       kind,
-      metadata: { project: s.projectName, dataset: s.dataset.meta.name, loss: s.trainingConfig.loss },
+      metadata: {
+        project: s.projectName,
+        dataset: s.dataset.meta.name,
+        loss: s.trainingConfig.loss,
+        // The architecture already carries the full reasoning plan; this is a
+        // human-readable summary for anyone inspecting the file.
+        reasoning: s.model.reasoningLayers().length
+          ? {
+              layers: s.model.reasoningLayers().map((l) => ({
+                id: l.id,
+                name: l.name,
+                steps: l.info.plan.steps,
+                hidden: l.info.plan.hidden,
+                adaptive: l.info.plan.adaptive,
+                haltThreshold: l.info.plan.haltThreshold,
+                activation: l.info.plan.activation,
+              })),
+            }
+          : undefined,
+      },
       optimizer: kind === "checkpoint" ? s.trainingConfig.optimizer : undefined,
       optimizerState: kind === "checkpoint" ? s.trainer?.optState : undefined,
       epoch: s.progress.epoch,
@@ -30,8 +49,8 @@ export function ExportView() {
     setMsg(
       `Wrote ${filename}. ${
         kind === "model"
-          ? "Contains architecture + float32 weights (base64). This is not ONNX and is not a resumable training checkpoint."
-          : "Includes architecture, weights, optimiser state and epoch for resuming inside NeuronForge."
+          ? `Contains architecture + float32 weights (base64)${s.model.reasoningLayers().length ? `, including the Deep Reasoning plan and ${s.model.reasoningLayers().length} reasoning block${s.model.reasoningLayers().length > 1 ? "s" : ""}` : ""}. This is not ONNX and is not a resumable training checkpoint.`
+          : `Includes architecture, weights, optimiser state and epoch for resuming inside NeuronForge${s.model.reasoningLayers().length ? ", including the Deep Reasoning plan" : ""}.`
       }`,
     );
     setOk(true);

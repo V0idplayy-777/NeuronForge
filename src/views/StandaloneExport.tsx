@@ -84,6 +84,14 @@ export function StandaloneExport() {
         <Stat label="Dataset context" value={analysis.datasetCompatible ? "attached" : "none"} sub={s.dataset.meta.name} />
       </div>
       <p className="text-[11px] text-slate-400 mb-1">{analysis.taskReason}</p>
+      {analysis.reasoning && (
+        <div className="rounded-md border border-orange-400/30 bg-orange-500/5 px-3 py-2 mb-3 text-[11px] text-orange-100">
+          <span className="font-medium">Deep reasoning is part of this export</span> · {analysis.reasoning.layers} block
+          {analysis.reasoning.layers > 1 ? "s" : ""} · {analysis.reasoning.totalStepsPerForward} shared-weight deliberation steps per forward pass.
+          The JavaScript and Python runtimes execute the loop themselves and expose <code className="text-orange-200">model.reason()</code> with the per-step halting trace.
+          {analysis.reasoning.note}
+        </div>
+      )}
       <ul className="text-[11px] text-slate-300 space-y-0.5 mb-3 list-disc pl-4">
         {analysis.io.map((l) => (
           <li key={l}>{l}</li>

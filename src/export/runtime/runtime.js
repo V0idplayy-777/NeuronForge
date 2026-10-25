@@ -13,12 +13,12 @@
  * floating-point noise (and are usually bit-identical in the same JS engine).
  */
 
-var NF_RUNTIME_VERSION = "1.3.0";
+var NF_RUNTIME_VERSION = "1.4.0";
 var NF_BUNDLE_FORMAT = "neuronforge-standalone";
 var NF_BUNDLE_VERSION = 1;
 var NF_SUPPORTED_LAYERS = [
   "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-  "gap2d", "embedding", "attention", "transformer_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+  "gap2d", "embedding", "attention", "transformer_block", "reasoning_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
   "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 ];
 var NF_ACTIVATION_LAYERS = ["relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax"];
@@ -222,6 +222,10 @@ function nfInferShape(type, c, s, name) {
       var ap = nfAttentionPlan(c, s, name);
       return nfAttentionOut(ap, s[0]);
     }
+    case "reasoning_block": {
+      var rplan = nfReasoningPlan(c, s, name);
+      return [rplan.D];
+    }
     case "residual_dense": {
       if (s.length !== 1) fail("expects rank-1 input, got " + nfShapeStr(s));
       return [nfResidualWidth(c, s[0])];
@@ -347,6 +351,10 @@ function nfExpectedParams(type, c, s, out) {
         bq.bin_b = [bM];
       }
       return bq;
+    }
+    case "reasoning_block": {
+      var rp = nfReasoningPlan(c, s, "reasoning_block");
+      return { W1: [rp.D, rp.H], b1: [rp.H], W2: [rp.H, rp.D], b2: [rp.D], Wgate: [rp.D, 2], bgate: [2], ln_gamma: [rp.D], ln_beta: [rp.D] };
     }
     case "residual_dense": {
       var rd = { W1: [s[0], nfResidualWidth(c, s[0])], W2: [nfResidualWidth(c, s[0]), nfResidualWidth(c, s[0])] };
@@ -538,6 +546,69 @@ function nfLayerNormRows(X, rows, cols, gamma, beta, eps) {
     }
   }
   return out;
+}
+
+/* -------------------------------------------------------------- reasoning */
+
+/**
+ * Runtime knobs for Deep Reasoning. `model.reason(input, options)` sets these
+ * for the duration of one forward pass; normal inference leaves them null and
+ * uses the plan stored in the bundle.
+ */
+var nfReasoningRuntime = { steps: null, adaptive: null, haltThreshold: null };
+
+function nfReasoningPlan(c, s, name) {
+  if (s.length !== 1) {
+    throw new Error("Layer '" + name + "' (reasoning_block): expects a flat vector [features], got " + nfShapeStr(s) + ". Pool the sequence first.");
+  }
+  var D = s[0];
+  var rawH = Math.round(nfNum(c.hidden, 0));
+  var H = rawH > 0 ? rawH : Math.max(1, D * 2);
+  var steps = Math.max(1, Math.min(64, Math.round(nfNum(c.steps, 8))));
+  var minSteps = Math.max(1, Math.min(steps, Math.round(nfNum(c.minSteps, 2))));
+  var threshold = Math.max(0.5, Math.min(0.9999, nfNum(c.haltThreshold, 0.99)));
+  var act = c.activation === undefined || c.activation === null ? "gelu" : String(c.activation);
+  if (act === "none") act = "linear";
+  return {
+    D: D,
+    H: H,
+    steps: steps,
+    minSteps: minSteps,
+    adaptive: nfBool(c.adaptive, false),
+    haltThreshold: threshold,
+    activation: act,
+    stepCode: nfBool(c.stepCode, true),
+    stepCodeScale: nfNum(c.stepCodeScale, 1),
+    epsilon: Math.max(1e-6, Math.min(1e-2, nfNum(c.epsilon, 1e-5))),
+  };
+}
+
+/** Must match nfReasoningStepCode in src/engine/reasoning.ts operation for operation. */
+function nfReasoningStepCode(step, width, scale) {
+  var code = new Float32Array(width);
+  var denom = Math.max(1, width);
+  for (var j = 0; j < width; j++) {
+    var freq = Math.exp(-(j / denom) * Math.log(10000));
+    var angle = (step + 1) * freq;
+    code[j] = (j % 2 === 0 ? Math.sin(angle) : Math.cos(angle)) * scale;
+  }
+  return code;
+}
+
+function nfCopyReasoningTrace(t) {
+  if (!t) return null;
+  return {
+    layerId: t.layerId,
+    name: t.name,
+    steps: t.steps,
+    stepsUsed: t.stepsUsed,
+    halted: t.halted,
+    halt: t.halt.slice(),
+    cumulativeHalt: t.cumulativeHalt.slice(),
+    deltaNorm: t.deltaNorm.slice(),
+    stateNorm: t.stateNorm.slice(),
+    changeNorm: t.changeNorm.slice(),
+  };
 }
 
 /** Multi-head self-attention over a [B·T, M] input. Mirrors the engine loop for loop. */
@@ -846,6 +917,102 @@ function nfCompile(def, s, out, P) {
         var pooled = bp.pool === "none" ? Y : nfPoolAttention(Y, B, T, bM, bp.pool);
         return { shape: [B].concat(nfAttentionOut(bp, T)), data: pooled };
       };
+    }
+    case "reasoning_block": {
+      var rp = nfReasoningPlan(c, s, name);
+      var rD = rp.D;
+      var rH = rp.H;
+      var rFn = function (x) {
+        if (x.shape.length !== 2 || x.shape[1] !== rD) {
+          throw new Error("Deep Reasoning '" + name + "': expected [B, " + rD + "], got " + nfShapeStr(x.shape));
+        }
+        var B = x.shape[0];
+        var steps = nfReasoningRuntime.steps === null || nfReasoningRuntime.steps === undefined
+          ? rp.steps
+          : Math.max(1, Math.min(256, Math.round(Number(nfReasoningRuntime.steps))));
+        var adaptive = nfReasoningRuntime.adaptive === null || nfReasoningRuntime.adaptive === undefined
+          ? rp.adaptive
+          : !!nfReasoningRuntime.adaptive;
+        var threshold = nfReasoningRuntime.haltThreshold === null || nfReasoningRuntime.haltThreshold === undefined
+          ? rp.haltThreshold
+          : Math.max(0, Math.min(1, Number(nfReasoningRuntime.haltThreshold)));
+        var h = new Float32Array(x.data);
+        var trace = {
+          layerId: def.id,
+          name: name,
+          steps: rp.steps,
+          stepsUsed: 0,
+          halted: false,
+          halt: [],
+          cumulativeHalt: [],
+          deltaNorm: [],
+          stateNorm: [],
+          changeNorm: [],
+        };
+        var remaining = 1;
+        for (var t = 0; t < steps; t++) {
+          var ln = nfLayerNormRows(h, B, rD, P.ln_gamma, P.ln_beta, rp.epsilon);
+          var u = new Float32Array(ln);
+          if (rp.stepCode) {
+            var code = nfReasoningStepCode(t, rD, rp.stepCodeScale);
+            for (var b0 = 0; b0 < B; b0++) {
+              var off0 = b0 * rD;
+              for (var d0 = 0; d0 < rD; d0++) u[off0 + d0] += code[d0];
+            }
+          }
+          var pre = nfAddBias(nfMatmul(u, B, rD, P.W1, rH), B, rH, P.b1);
+          var act = rp.activation === "linear" ? pre : nfActivation(rp.activation, pre, rH, 0.01);
+          var delta = nfAddBias(nfMatmul(act, B, rH, P.W2, rD), B, rD, P.b2);
+          var logits = nfAddBias(nfMatmul(u, B, rD, P.Wgate, 2), B, 2, P.bgate);
+          var meanHalt = 0;
+          var meanDelta = 0;
+          var meanState = 0;
+          var meanChange = 0;
+          for (var b = 0; b < B; b++) {
+            var write = nfSigmoid1(logits[b * 2]);
+            var halt = nfSigmoid1(logits[b * 2 + 1]);
+            var gate = write * (1 - halt);
+            var off = b * rD;
+            var d2 = 0;
+            var s2 = 0;
+            var c2 = 0;
+            for (var d = 0; d < rD; d++) {
+              var dv = delta[off + d];
+              var change = gate * dv;
+              h[off + d] += change;
+              d2 += dv * dv;
+              c2 += change * change;
+              var hv = h[off + d];
+              s2 += hv * hv;
+            }
+            meanHalt += halt;
+            meanDelta += Math.sqrt(d2);
+            meanState += Math.sqrt(s2);
+            meanChange += Math.sqrt(c2);
+          }
+          meanHalt /= B;
+          meanDelta /= B;
+          meanState /= B;
+          meanChange /= B;
+          remaining *= 1 - meanHalt;
+          var cumulative = 1 - remaining;
+          trace.halt.push(meanHalt);
+          trace.cumulativeHalt.push(cumulative);
+          trace.deltaNorm.push(meanDelta);
+          trace.stateNorm.push(meanState);
+          trace.changeNorm.push(meanChange);
+          trace.stepsUsed = t + 1;
+          if (adaptive && t + 1 >= rp.minSteps && cumulative >= threshold) {
+            trace.halted = true;
+            break;
+          }
+        }
+        rFn._nfReasoning = { trace: trace };
+        return { shape: [B, rD], data: h };
+      };
+      rFn._nfReasoningMeta = { id: def.id, name: name, plan: rp };
+      rFn._nfReasoning = { trace: null };
+      return rFn;
     }
     case "embedding": {
       var vocab = nfNum(c.vocabSize, 32);
@@ -1320,6 +1487,53 @@ function createModel(bundle, options) {
     return x;
   }
 
+  /** Traces from the most recent forward pass, one per Deep Reasoning layer. */
+  function reasoningTraces() {
+    var out = [];
+    for (var i = 0; i < layers.length; i++) {
+      var fn = layers[i];
+      if (fn._nfReasoningMeta && fn._nfReasoning) {
+        var t = nfCopyReasoningTrace(fn._nfReasoning.trace);
+        if (t) out.push(t);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Run one forward pass with Deep Reasoning tracing enabled. `steps`,
+   * `adaptive` and `haltThreshold` override the exported plan for this call;
+   * they do not persist. The weights — and therefore the learned reasoning —
+   * are the ones in the bundle.
+   */
+  function reason(input, options) {
+    options = options || {};
+    var hasReasoning = false;
+    for (var i = 0; i < layers.length; i++) if (layers[i]._nfReasoningMeta) hasReasoning = true;
+    if (!hasReasoning) throw new Error("This model has no Deep Reasoning layers; reason() is only available for models exported with reasoning_block layers");
+    var batch = options.batch === undefined || options.batch === null ? 1 : Math.max(1, Math.floor(Number(options.batch)));
+    var flat;
+    if (typeof input === "string") {
+      if (!tok) throw new Error("reason(prompt) needs a tokenizer; this model was exported without one. Pass numeric features instead.");
+      flat = contextWindow(tokenize(input));
+      batch = 1;
+    } else {
+      flat = nfFlatten(input, []);
+    }
+    var saved = { steps: nfReasoningRuntime.steps, adaptive: nfReasoningRuntime.adaptive, haltThreshold: nfReasoningRuntime.haltThreshold };
+    nfReasoningRuntime.steps = options.steps === undefined || options.steps === null ? null : Number(options.steps);
+    nfReasoningRuntime.adaptive = options.adaptive === undefined || options.adaptive === null ? null : !!options.adaptive;
+    nfReasoningRuntime.haltThreshold = options.haltThreshold === undefined || options.haltThreshold === null ? null : Number(options.haltThreshold);
+    try {
+      var out = forwardBatch(Float32Array.from(flat), batch);
+      return { shape: out.shape.slice(), data: out.data, traces: reasoningTraces() };
+    } finally {
+      nfReasoningRuntime.steps = saved.steps;
+      nfReasoningRuntime.adaptive = saved.adaptive;
+      nfReasoningRuntime.haltThreshold = saved.haltThreshold;
+    }
+  }
+
   function labelFor(i) {
     return output.classNames && output.classNames[i] !== undefined ? String(output.classNames[i]) : String(i);
   }
@@ -1509,8 +1723,10 @@ function createModel(bundle, options) {
     var ctx = promptIds.slice();
     var ids = [];
     var stoppedBy = null;
+    var stepped = false;
     for (var t = 0; t < maxTokens; t++) {
       var probs = forwardBatch(Float32Array.from(contextWindow(ctx)), 1).data;
+      stepped = true;
       var idx = nfSample(probs, temperature, topK, rng);
       var token = tok.tokens[idx];
       if (token === undefined) throw new Error("Model produced class id " + idx + " outside the vocabulary");
@@ -1523,7 +1739,7 @@ function createModel(bundle, options) {
     }
     var text = detokenize(ids);
     var full = tok.level === "word" ? (text && !/^[,.;:!?)\]}]/.test(text) ? String(prompt).trim() + " " + text : String(prompt).trim() + text) : String(prompt) + text;
-    return {
+    var result = {
       text: text,
       fullText: full,
       ids: ids,
@@ -1532,6 +1748,11 @@ function createModel(bundle, options) {
       stoppedBy: stoppedBy,
       settings: { maxTokens: maxTokens, temperature: temperature, topK: topK, seed: seed, stop: stopList },
     };
+    if (o.traceReasoning && stepped) {
+      var rt = reasoningTraces();
+      if (rt.length) result.reasoning = rt;
+    }
+    return result;
   }
 
   function imageToInput(image, o) {
@@ -1621,6 +1842,53 @@ function createModel(bundle, options) {
         add("preprocessing #" + (i + 1), "fail", String(err && err.message ? err.message : err));
       }
     });
+    (t.reasoning || []).forEach(function (tc, i) {
+      try {
+        var r = reason(tc.input, {});
+        var maxAbs = 0;
+        var bad = 0;
+        if (r.data.length !== tc.output.length) {
+          bad = Math.max(r.data.length, tc.output.length);
+        } else {
+          for (var j = 0; j < r.data.length; j++) {
+            var expected = tc.output[j];
+            var d = Math.abs(r.data[j] - expected);
+            if (d > maxAbs) maxAbs = d;
+            if (!(d <= tol.atol + tol.rtol * Math.abs(expected))) bad++;
+          }
+        }
+        var traceBad = r.traces.length !== tc.traces.length;
+        var stepsText = [];
+        for (var k = 0; k < Math.min(r.traces.length, tc.traces.length); k++) {
+          var a = r.traces[k];
+          var b = tc.traces[k];
+          stepsText.push(a.stepsUsed + "/" + a.steps);
+          if (a.layerId !== b.layerId || a.stepsUsed !== b.stepsUsed || a.halted !== b.halted) traceBad = true;
+          ["halt", "cumulativeHalt", "deltaNorm", "stateNorm", "changeNorm"].forEach(function (key) {
+            var x = a[key] || [];
+            var y = b[key] || [];
+            if (x.length !== y.length) {
+              traceBad = true;
+              return;
+            }
+            for (var q = 0; q < x.length; q++) {
+              if (!(Math.abs(x[q] - y[q]) <= 1e-4 + 1e-3 * Math.abs(y[q]))) traceBad = true;
+            }
+          });
+        }
+        add(
+          "reasoning #" + (i + 1),
+          bad === 0 && !traceBad ? "pass" : "fail",
+          bad === 0 && !traceBad
+            ? "deep reasoning reproduced · depth " + stepsText.join(", ") + " · halting trace matches"
+            : bad
+              ? bad + " output values outside tolerance (max |diff| " + maxAbs.toExponential(2) + ")"
+              : "reasoning trace differs from the exported engine trace",
+        );
+      } catch (err) {
+        add("reasoning #" + (i + 1), "fail", String(err && err.message ? err.message : err));
+      }
+    });
     if (checks.length === 0) add("embedded tests", "warn", "bundle contains no test vectors");
     return {
       ok: checks.every(function (c) { return c.status !== "fail"; }),
@@ -1652,6 +1920,7 @@ function createModel(bundle, options) {
     preprocessing: pp ? { kind: pp.kind, columns: pp.columns.map(function (c) { return c.name; }), normalize: pp.normalize, missing: pp.missing } : null,
     image: img,
     sampling: sampling,
+    reasoning: bundle.reasoning || null,
     runtimeVersion: NF_RUNTIME_VERSION,
     exportedAt: bundle.exportedAt,
     limitations: bundle.limitations || [],
@@ -1676,6 +1945,8 @@ function createModel(bundle, options) {
       return o && o.includePrompt ? r.fullText : r.text;
     },
     generateDetailed: generateDetailed,
+    reason: reason,
+    getReasoning: reasoningTraces,
     imageToInput: imageToInput,
     predictImage: function (image, o) {
       var flat = imageToInput(image, o);

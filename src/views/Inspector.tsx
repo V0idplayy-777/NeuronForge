@@ -81,6 +81,33 @@ export function InspectorView() {
               </Panel>
             )}
             {paramNames.length === 0 && <p className="text-xs text-slate-500">This layer has no trainable parameters.</p>}
+            {layer.reasoning && (
+              <Panel title="Deep reasoning trace (most recent forward)">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+                  <Stat label="Configured depth" value={layer.reasoning.plan.steps} />
+                  <Stat label="Steps used" value={layer.reasoning.trace?.stepsUsed ?? "—"} sub={layer.reasoning.trace?.halted ? "halted early" : "full depth"} />
+                  <Stat label="Thought width" value={layer.reasoning.plan.hidden} />
+                  <Stat label="Halting" value={layer.reasoning.plan.adaptive ? "adaptive" : "fixed"} sub={`threshold ${layer.reasoning.plan.haltThreshold}`} />
+                </div>
+                {layer.reasoning.trace ? (
+                  <>
+                    <div className="flex items-end gap-1 h-16">
+                      {layer.reasoning.trace.halt.map((h, i) => (
+                        <div key={i} className="flex-1 flex flex-col items-center justify-end h-full" title={`step ${i + 1}: halt ${h.toFixed(3)}, Δnorm ${layer.reasoning!.trace!.deltaNorm[i]?.toFixed(3)}`}>
+                          <div className="w-full bg-orange-400/70 rounded-sm" style={{ height: `${Math.max(3, h * 100)}%` }} />
+                          <span className="text-[9px] text-slate-500 font-mono">{i + 1}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
+                      Each bar is one shared-weight deliberation step: its height is the learned halting probability. The state update is gated by write × (1 − halt), so the loop is deep computation rather than a fixed feed-forward pass. The same trace is exposed by the exported runtime as model.reason().
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-slate-500">Run a forward pass (select a matching dataset sample) to collect the trace.</p>
+                )}
+              </Panel>
+            )}
             <Panel title="Activations on train sample">
               <label className="text-[11px] text-slate-400 flex items-center gap-2 mb-2">
                 index

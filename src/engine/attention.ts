@@ -141,7 +141,7 @@ export function attentionSummary(type: "attention" | "transformer_block", config
 /* ------------------------------------------------------- Float32 primitives */
 
 /** C[M,N] += alpha · A[M,K] · B[K,N]. */
-function mmInto(A: Float32Array, B: Float32Array, M: number, K: number, N: number, C: Float32Array, alpha = 1): void {
+export function mmInto(A: Float32Array, B: Float32Array, M: number, K: number, N: number, C: Float32Array, alpha = 1): void {
   for (let i = 0; i < M; i++) {
     const aOff = i * K;
     const cOff = i * N;
@@ -155,7 +155,7 @@ function mmInto(A: Float32Array, B: Float32Array, M: number, K: number, N: numbe
 }
 
 /** C[M,N] += alpha · Aᵀ · B with A [K,M] and B [K,N]. */
-function mmAtInto(A: Float32Array, B: Float32Array, K: number, M: number, N: number, C: Float32Array, alpha = 1): void {
+export function mmAtInto(A: Float32Array, B: Float32Array, K: number, M: number, N: number, C: Float32Array, alpha = 1): void {
   for (let k = 0; k < K; k++) {
     const aOff = k * M;
     const bOff = k * N;
@@ -169,7 +169,7 @@ function mmAtInto(A: Float32Array, B: Float32Array, K: number, M: number, N: num
 }
 
 /** C[M,N] += alpha · A · Bᵀ with A [M,K] and B [N,K]. */
-function mmBtInto(A: Float32Array, B: Float32Array, M: number, K: number, N: number, C: Float32Array, alpha = 1): void {
+export function mmBtInto(A: Float32Array, B: Float32Array, M: number, K: number, N: number, C: Float32Array, alpha = 1): void {
   for (let i = 0; i < M; i++) {
     const aOff = i * K;
     const cOff = i * N;
@@ -183,7 +183,7 @@ function mmBtInto(A: Float32Array, B: Float32Array, M: number, K: number, N: num
 }
 
 /** Column sums of a [rows, cols] matrix (used for bias gradients). */
-function colSum(X: Float32Array, rows: number, cols: number, out: Float32Array): void {
+export function colSum(X: Float32Array, rows: number, cols: number, out: Float32Array): void {
   for (let r = 0; r < rows; r++) {
     const off = r * cols;
     for (let j = 0; j < cols; j++) out[j]! += X[off + j]!;
@@ -246,12 +246,12 @@ function softmaxRowsBackward(
 
 /* -------------------------------------------------------------- layer norm */
 
-interface NormCache {
+export interface NormCache {
   xhat: Float32Array;
   invStd: Float32Array;
 }
 
-function layerNormForward(
+export function layerNormForward(
   X: Float32Array,
   rows: number,
   cols: number,
@@ -284,7 +284,7 @@ function layerNormForward(
   return { out, cache: { xhat, invStd } };
 }
 
-function layerNormBackward(
+export function layerNormBackward(
   dy: Float32Array,
   rows: number,
   cols: number,

@@ -38,12 +38,12 @@ import sys
 
 import numpy as np
 
-RUNTIME_VERSION = "1.3.0"
+RUNTIME_VERSION = "1.4.0"
 BUNDLE_FORMAT = "neuronforge-standalone"
 BUNDLE_VERSION = 1
 SUPPORTED_LAYERS = (
     "dense", "flatten", "reshape", "dropout", "batchnorm", "layernorm", "conv2d", "maxpool2d", "avgpool2d",
-    "gap2d", "embedding", "attention", "transformer_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
+    "gap2d", "embedding", "attention", "transformer_block", "reasoning_block", "rnn", "lstm", "gru", "residual_dense", "residual_conv",
     "identity", "relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax",
 )
 ACTIVATION_LAYERS = ("relu", "leakyrelu", "gelu", "silu", "sigmoid", "tanh", "softmax")
@@ -161,6 +161,49 @@ def _residual_conv_plan(c, s, name):
     }
 
 
+# ---------------------------------------------------------------- reasoning
+
+# Runtime knobs used by StandaloneModel.reason(); normal inference leaves them
+# at None and uses the plan embedded in the bundle.
+_REASONING_RUNTIME = {"steps": None, "adaptive": None, "halt_threshold": None}
+
+
+def _reasoning_plan(c, s, name):
+    if len(s) != 1:
+        raise ValueError(f"Layer '{name}' (reasoning_block): expects a flat vector [features], got {list(s)}. Pool the sequence first.")
+    D = int(s[0])
+    raw_h = int(round(_num(c.get("hidden"), 0)))
+    H = raw_h if raw_h > 0 else max(1, D * 2)
+    steps = max(1, min(64, int(round(_num(c.get("steps"), 8)))))
+    min_steps = max(1, min(steps, int(round(_num(c.get("minSteps"), 2)))))
+    threshold = max(0.5, min(0.9999, _num(c.get("haltThreshold"), 0.99)))
+    act = str(c.get("activation") if c.get("activation") is not None else "gelu")
+    if act == "none":
+        act = "linear"
+    return {
+        "D": D, "H": H, "steps": steps, "minSteps": min_steps,
+        "adaptive": _bool(c.get("adaptive"), False), "haltThreshold": threshold,
+        "activation": act, "stepCode": _bool(c.get("stepCode"), True),
+        "stepCodeScale": _num(c.get("stepCodeScale"), 1.0),
+        "epsilon": max(1e-6, min(1e-2, _num(c.get("epsilon"), 1e-5))),
+    }
+
+
+def _reasoning_step_code(step, width, scale):
+    """Mirror of reasoningStepCode() in src/engine/reasoning.ts."""
+    j = np.arange(width, dtype=F64)
+    freq = np.exp(-(j / max(1, width)) * math.log(10000.0))
+    angle = (step + 1) * freq
+    code = np.where(j % 2 == 0, np.sin(angle), np.cos(angle)) * scale
+    return code.astype(F32)
+
+
+def _copy_reasoning_trace(t):
+    if not t:
+        return None
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in t.items()}
+
+
 def _infer_shape(t, c, s, name):
     def fail(msg):
         raise ValueError(f"Layer '{name}' ({t}): {msg}")
@@ -217,6 +260,9 @@ def _infer_shape(t, c, s, name):
             fail(f"expects a sequence [seqLen, features], got {s}")
         plan = _attention_plan(c, s, name)
         return list(_attention_out(plan, s[0]))
+    if t == "reasoning_block":
+        rp = _reasoning_plan(c, s, name)
+        return [rp["D"]]
     if t == "residual_dense":
         if len(s) != 1:
             fail(f"expects rank-1 input, got {s}")
@@ -326,6 +372,10 @@ def _expected_params(t, c, s, out):
             p["Win"] = [s[1], m]
             p["bin_b"] = [m]
         return p
+    if t == "reasoning_block":
+        rp = _reasoning_plan(c, s, "reasoning_block")
+        D, H = rp["D"], rp["H"]
+        return {"W1": [D, H], "b1": [H], "W2": [H, D], "b2": [D], "Wgate": [D, 2], "bgate": [2], "ln_gamma": [D], "ln_beta": [D]}
     if t == "residual_dense":
         w = _residual_width(c, s[0])
         p = {"W1": [s[0], w], "W2": [w, w]}
@@ -792,6 +842,76 @@ def _compile(d, c, s, out, P):
             return _pool_attention(y, B, T, plan).astype(F32)
         return f
 
+    if t == "reasoning_block":
+        rp = _reasoning_plan(c, s, name)
+        D, H = rp["D"], rp["H"]
+        eps = rp["epsilon"]
+        act = rp["activation"]
+        W1 = P["W1"].astype(F64)
+        b1 = P["b1"].astype(F64)
+        W2 = P["W2"].astype(F64)
+        b2 = P["b2"].astype(F64)
+        Wg = P["Wgate"].astype(F64)
+        bg = P["bgate"].astype(F64)
+        gamma = P["ln_gamma"].astype(F64)
+        beta = P["ln_beta"].astype(F64)
+
+        def f(x):
+            if x.ndim != 2 or x.shape[1] != D:
+                raise ValueError(f"Deep Reasoning '{name}': expected [B, {D}], got {list(x.shape)}")
+            B = int(x.shape[0])
+            raw_steps = _REASONING_RUNTIME["steps"]
+            steps = rp["steps"] if raw_steps is None else max(1, min(256, int(round(float(raw_steps)))))
+            raw_adaptive = _REASONING_RUNTIME["adaptive"]
+            adaptive = rp["adaptive"] if raw_adaptive is None else bool(raw_adaptive)
+            raw_threshold = _REASONING_RUNTIME["halt_threshold"]
+            threshold = rp["haltThreshold"] if raw_threshold is None else max(0.0, min(1.0, float(raw_threshold)))
+            h = x.astype(F32).copy()
+            trace = {
+                "layerId": d["id"], "name": name, "steps": rp["steps"], "stepsUsed": 0,
+                "halted": False, "halt": [], "cumulativeHalt": [], "deltaNorm": [],
+                "stateNorm": [], "changeNorm": [],
+            }
+            remaining = 1.0
+            for t in range(steps):
+                ln = _layer_norm_rows(h.astype(F64), gamma, beta, eps).astype(F32)
+                u = ln.astype(F32).copy()
+                if rp["stepCode"]:
+                    u = (u.astype(F64) + _reasoning_step_code(t, D, rp["stepCodeScale"]).astype(F64)[None, :]).astype(F32)
+                pre = (u.astype(F64) @ W1).astype(F32).astype(F64) + b1
+                pre = pre.astype(F32)
+                a = pre if act == "linear" else _activation(act, pre, 0.01)
+                delta = (a.astype(F64) @ W2).astype(F32).astype(F64) + b2
+                delta = delta.astype(F32)
+                logits = (u.astype(F64) @ Wg).astype(F32).astype(F64) + bg
+                logits = logits.astype(F32)
+                write = _sigmoid(logits[:, 0]).astype(F64)
+                halt = _sigmoid(logits[:, 1]).astype(F64)
+                gate = write * (1.0 - halt)
+                change = gate[:, None] * delta.astype(F64)
+                h = (h.astype(F64) + change).astype(F32)
+                mean_halt = float(np.mean(halt))
+                mean_delta = float(np.mean(np.sqrt(np.sum(delta.astype(F64) ** 2, axis=1))))
+                mean_state = float(np.mean(np.sqrt(np.sum(h.astype(F64) ** 2, axis=1))))
+                mean_change = float(np.mean(np.sqrt(np.sum(change ** 2, axis=1))))
+                remaining *= 1.0 - mean_halt
+                cumulative = 1.0 - remaining
+                trace["halt"].append(mean_halt)
+                trace["cumulativeHalt"].append(cumulative)
+                trace["deltaNorm"].append(mean_delta)
+                trace["stateNorm"].append(mean_state)
+                trace["changeNorm"].append(mean_change)
+                trace["stepsUsed"] = t + 1
+                if adaptive and t + 1 >= rp["minSteps"] and cumulative >= threshold:
+                    trace["halted"] = True
+                    break
+            f._nf_reasoning = trace
+            return h
+
+        f._nf_reasoning = None
+        f._nf_reasoning_meta = rp
+        return f
+
     if t == "embedding":
         vocab = _int(c.get("vocabSize"), 32)
         Wt = P["W"]
@@ -1085,6 +1205,7 @@ class StandaloneModel:
         self.in_size = _numel(self.input_shape)
         self.task = bundle.get("task", "raw")
         self.output = bundle.get("output") or {}
+        self.reasoning = bundle.get("reasoning")
         self.tokenizer = bundle.get("tokenizer")
         self.preprocessing = bundle.get("preprocessing")
         self.image = bundle.get("image")
@@ -1269,7 +1390,51 @@ class StandaloneModel:
     def next_token(self, text):
         return self.predict(str(text))
 
-    def generate_detailed(self, prompt, max_tokens=60, temperature=None, top_k=None, seed=None, stop=None, stop_at_eos=True):
+    # ---- deep reasoning ----
+    def _reasoning_traces(self):
+        out = []
+        for layer in self.layers:
+            t = getattr(layer, "_nf_reasoning", None)
+            if t:
+                out.append(_copy_reasoning_trace(t))
+        return out
+
+    def reason(self, x, steps=None, adaptive=None, halt_threshold=None):
+        """Run one forward pass and return the Deep Reasoning trace.
+
+        `steps`, `adaptive` and `halt_threshold` override the exported plan for
+        this call only. The reasoning weights are the ones in the bundle — no
+        approximation and no external service.
+        """
+        if not any(getattr(layer, "_nf_reasoning_meta", None) for layer in self.layers):
+            raise ValueError("This model has no Deep Reasoning layers; reason() is only available for models exported with reasoning_block layers")
+        if isinstance(x, str):
+            if not self.tokenizer:
+                raise ValueError("reason(prompt) needs a tokenizer; this model was exported without one. Pass numeric features instead.")
+            vals = np.asarray(self._window(self.tokenize(x)), dtype=F32)
+            batch = 1
+        else:
+            vals = np.asarray(x, dtype=F32).reshape(-1)
+            if vals.size == 0 or vals.size % self.in_size != 0:
+                raise ValueError(f"Expected a multiple of {self.in_size} input values for shape {self.input_shape}, got {vals.size}")
+            batch = vals.size // self.in_size
+        saved = dict(_REASONING_RUNTIME)
+        _REASONING_RUNTIME["steps"] = None if steps is None else int(steps)
+        _REASONING_RUNTIME["adaptive"] = None if adaptive is None else bool(adaptive)
+        _REASONING_RUNTIME["halt_threshold"] = None if halt_threshold is None else float(halt_threshold)
+        try:
+            out = self.forward(vals.reshape((batch,) + tuple(self.input_shape)))
+            return {"shape": list(out.shape), "data": np.asarray(out, dtype=F32).reshape(-1), "traces": self._reasoning_traces()}
+        finally:
+            _REASONING_RUNTIME["steps"] = saved["steps"]
+            _REASONING_RUNTIME["adaptive"] = saved["adaptive"]
+            _REASONING_RUNTIME["halt_threshold"] = saved["halt_threshold"]
+
+    def get_reasoning(self):
+        """Traces from the most recent forward pass (empty if none)."""
+        return self._reasoning_traces()
+
+    def generate_detailed(self, prompt, max_tokens=60, temperature=None, top_k=None, seed=None, stop=None, stop_at_eos=True, trace_reasoning=False):
         if not self.tokenizer or self.task != "language":
             raise ValueError("generate() is only available for language models")
         temperature = self.sampling["temperature"] if temperature is None else float(temperature)
@@ -1291,9 +1456,11 @@ class StandaloneModel:
         ctx = list(prompt_ids)
         ids = []
         stopped_by = None
+        stepped = False
         toks = self.tokenizer["tokens"]
         for _ in range(int(max_tokens)):
             probs = self.forward(np.asarray([self._window(ctx)], dtype=F32)).reshape(-1)
+            stepped = True
             idx = sample_from_probs(probs, temperature, top_k, rng)
             if toks[idx] in stop:
                 stopped_by = toks[idx]
@@ -1305,8 +1472,13 @@ class StandaloneModel:
             full = str(prompt).strip() + ("" if not text or text[0] in ",.;:!?)]}" else " ") + text
         else:
             full = str(prompt) + text
-        return {"text": text, "fullText": full, "ids": ids, "tokens": [toks[i] for i in ids], "promptIds": prompt_ids,
-                "stoppedBy": stopped_by, "settings": {"maxTokens": max_tokens, "temperature": temperature, "topK": top_k, "seed": seed}}
+        result = {"text": text, "fullText": full, "ids": ids, "tokens": [toks[i] for i in ids], "promptIds": prompt_ids,
+                  "stoppedBy": stopped_by, "settings": {"maxTokens": max_tokens, "temperature": temperature, "topK": top_k, "seed": seed}}
+        if trace_reasoning and stepped:
+            rt = self._reasoning_traces()
+            if rt:
+                result["reasoning"] = rt
+        return result
 
     def generate(self, prompt, max_tokens=60, temperature=None, top_k=None, seed=None, stop=None, include_prompt=False):
         r = self.generate_detailed(prompt, max_tokens, temperature, top_k, seed, stop)
@@ -1379,6 +1551,38 @@ class StandaloneModel:
                                "identical tokens" if same else "sampled tokens diverged (expected occasionally: float differences can flip a sampling tie)"))
             except Exception as e:  # noqa: BLE001
                 checks.append((f"generation #{i + 1}", "fail", str(e)))
+        for i, tc in enumerate(tests.get("reasoning", [])):
+            try:
+                r = self.reason(tc["input"])
+                got = np.asarray(r["data"], dtype=F64).reshape(-1)
+                exp = np.asarray(tc["output"], dtype=F64)
+                if got.shape != exp.shape:
+                    checks.append((f"reasoning #{i + 1}", "fail", f"output length {got.size} != {exp.size}"))
+                    continue
+                diff = np.abs(got - exp)
+                bad = int(np.sum(diff > atol + rtol * np.abs(exp)))
+                trace_bad = len(r["traces"]) != len(tc["traces"])
+                step_note = []
+                for a, b in zip(r["traces"], tc["traces"]):
+                    step_note.append(f"{a['stepsUsed']}/{a['steps']}")
+                    if a["layerId"] != b["layerId"] or a["stepsUsed"] != b["stepsUsed"] or a["halted"] != b["halted"]:
+                        trace_bad = True
+                    for key in ("halt", "cumulativeHalt", "deltaNorm", "stateNorm", "changeNorm"):
+                        x = np.asarray(a.get(key) or [], dtype=F64)
+                        y = np.asarray(b.get(key) or [], dtype=F64)
+                        if x.shape != y.shape:
+                            trace_bad = True
+                        elif x.size and not bool(np.all(np.abs(x - y) <= 1e-4 + 1e-3 * np.abs(y))):
+                            trace_bad = True
+                if bad:
+                    status, detail = "fail", f"{bad} output values outside tolerance (max |diff| {diff.max():.2e})"
+                elif trace_bad:
+                    status, detail = "warn", "output matches; per-step trace differs slightly (float ordering / a halting boundary)"
+                else:
+                    status, detail = "pass", "deep reasoning reproduced · depth " + ", ".join(step_note) + " · halting trace matches"
+                checks.append((f"reasoning #{i + 1}", status, detail))
+            except Exception as e:  # noqa: BLE001
+                checks.append((f"reasoning #{i + 1}", "fail", str(e)))
         for i, tc in enumerate(tests.get("preprocessing", [])):
             try:
                 enc = np.asarray(self.encode(tc["raw"]), dtype=F64)
@@ -1394,6 +1598,7 @@ class StandaloneModel:
     def info(self):
         return {"name": self.bundle.get("name"), "task": self.task, "inputShape": self.input_shape,
                 "outputShape": self.output_shape, "paramCount": self.param_count, "layers": self.layer_info,
+                "reasoning": self.reasoning,
                 "tokenizer": None if not self.tokenizer else {"level": self.tokenizer["level"],
                                                               "vocabSize": len(self.tokenizer["tokens"]),
                                                               "seqLen": self.tokenizer["seqLen"],
@@ -1417,6 +1622,10 @@ def _main(argv):
     ap.add_argument("--verify", action="store_true", help="run the test vectors embedded by NeuronForge")
     ap.add_argument("--predict", help="comma-separated input values")
     ap.add_argument("--generate", help="prompt for language models")
+    ap.add_argument("--reason", help="comma-separated input values; prints the Deep Reasoning trace (use --reason=-1,2 for a negative first value)")
+    ap.add_argument("--reason-prompt", help="text prompt for the Deep Reasoning trace (language models)")
+    ap.add_argument("--reason-steps", type=int, default=None, help="override the reasoning depth for --reason / --reason-prompt")
+    ap.add_argument("--trace-reasoning", action="store_true", help="include the final-token reasoning trace in --generate output")
     ap.add_argument("--max-tokens", type=int, default=60)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--top-k", type=int, default=None)
@@ -1437,9 +1646,16 @@ def _main(argv):
         if not (m.preprocessing and m.preprocessing.get("kind") == "tabular"):
             vals = [float(v) for v in vals]
         print(json.dumps(m.predict(vals), indent=2))
+    if a.reason or a.reason_prompt is not None:
+        src = a.reason_prompt if a.reason_prompt is not None else [float(v.strip()) for v in a.reason.split(",")]
+        r = m.reason(src, steps=a.reason_steps)
+        print(json.dumps({"shape": r["shape"], "output": np.asarray(r["data"], dtype=float).tolist(), "traces": r["traces"]}, indent=2))
     if a.generate is not None:
-        print(m.generate(a.generate, a.max_tokens, a.temperature, a.top_k, a.seed, include_prompt=True))
-    if not (a.info or a.verify or a.predict or a.generate is not None):
+        if a.trace_reasoning:
+            print(json.dumps(m.generate_detailed(a.generate, a.max_tokens, a.temperature, a.top_k, a.seed, trace_reasoning=True), indent=2))
+        else:
+            print(m.generate(a.generate, a.max_tokens, a.temperature, a.top_k, a.seed, include_prompt=True))
+    if not (a.info or a.verify or a.predict or a.generate is not None or a.reason or a.reason_prompt is not None):
         ap.print_help()
     return 0
 

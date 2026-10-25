@@ -25,6 +25,12 @@ import {
   PY_VOCAB_TARGET,
   PY_MAX_WINDOWS,
 } from "./corpusCode";
+import {
+  buildReasonCorpus,
+  REASON_SEQ_LEN,
+  REASON_VOCAB_TARGET,
+  REASON_MAX_WINDOWS,
+} from "./corpusReason";
 
 /** Vocabulary targets for the built-in subword (BPE) language datasets. */
 export const BPE_VOCAB_TARGET = 320;
@@ -159,7 +165,8 @@ export type BuiltinId =
   | "tiny_text_bpe"
   | "tiny_text_2_bpe"
   | "nova_chat"
-  | "python_code";
+  | "python_code"
+  | "reason_traces";
 
 /** Context window length for the sequence-forecasting dataset. */
 export const SEQ_WINDOW = 12;
@@ -207,6 +214,7 @@ export const BUILTIN_INFO: Record<BuiltinId, { name: string; description: string
   tiny_text_2_bpe: { name: "Tiny BPE LM 2", description: `Subword (BPE) language modelling on the massive generated corpus: ${LM2_SEQ_LEN} tokens of context, a ~${BPE2_VOCAB_TARGET}-token learned vocabulary, closed by construction — every word in the corpus can be spelled from the learned pieces. The realistic middle ground between the character and whole-word datasets.`, task: "language", loss: "sparse_cce", shape: [LM2_SEQ_LEN], out: 1 },
   nova_chat: { name: "NovaChat — big conversation corpus", description: `The large conversational dataset, built for models that hold a conversation instead of completing fragments: a consistent persona ("nova"), thousands of q/a turns with multi-turn dialogues kept adjacent, correct computed arithmetic, jokes, riddles, trivia and supportive replies to feelings. ${NOVA_SEQ_LEN} tokens of context, a ~${NOVA_VOCAB_TARGET}-token BPE vocabulary. Train a transformer on it, then prompt with "q: ..." and a colon — the model answers in character.`, task: "language", loss: "sparse_cce", shape: [NOVA_SEQ_LEN], out: 1 },
   python_code: { name: "Python code (BPE, case-preserving)", description: `The Python specialist corpus for the code-generation presets: complete, runnable snippets — functions, loops, classes, comprehensions, stdlib usage — each introduced by a comment, most closed by an assert that proves it works. Tokenised with a CASE-SENSITIVE BPE vocabulary (~${PY_VOCAB_TARGET} tokens, ${PY_SEQ_LEN} tokens of context), so None, True, ValueError and CamelCase names survive intact. Prompt with a comment like "# reverse a list" and let the model write the code.`, task: "language", loss: "sparse_cce", shape: [PY_SEQ_LEN], out: 1 },
+  reason_traces: { name: "Reasoning traces (chain of thought)", description: `Explicit question → thought → answer traces in a strict format: arithmetic, counting, comparison, ordering, syllogisms and numeric sequences. Every line contains a "think:" section that works through the intermediate steps before the "a:" answer, all computed correctly at build time (lowercase words, no digits). Tokenised at word level (~${REASON_VOCAB_TARGET} words, so there are no unknown tokens) with ${REASON_SEQ_LEN} tokens of context — a complete trace fits in one window. Train the Deep Reasoner preset on it, then prompt with "q: ... think:" to see it show its work; the Deep Reasoning layer additionally runs iterative latent deliberation at every token.`, task: "language", loss: "sparse_cce", shape: [REASON_SEQ_LEN], out: 1 },
 };
 
 export function generateBuiltin(id: BuiltinId, params: SynthParams = DEFAULT_SYNTH): PreparedDataset {
@@ -470,6 +478,38 @@ export function generateBuiltin(id: BuiltinId, params: SynthParams = DEFAULT_SYN
       };
       return packLmWindows(meta, ids, seq, NOVA_MAX_WINDOWS, params);
     }
+    case "reason_traces": {
+      const seq = REASON_SEQ_LEN;
+      const { text, stats } = buildReasonCorpus(params.seed + 20261025);
+      corpusStats = stats;
+      // Word-level: the reasoning vocabulary is deliberately tiny (every word
+      // in the corpus fits under the cap), so a token is a whole word and a
+      // 48-token window still holds a complete question → trace → answer.
+      const tok = buildWordTokenizer(text, 256, seq);
+      const ids = tokenizeWords(text).map((w) => tok.tokenToId[w] ?? 0);
+      const meta: DatasetMeta = {
+        id,
+        name: info.name,
+        description: info.description,
+        source: "builtin",
+        task: info.task,
+        featureNames: Array.from({ length: seq }, (_, i) => `w-${seq - i}`),
+        targetNames: ["next_word"],
+        classNames: tok.tokens.slice(),
+        recommendedLoss: "sparse_cce",
+        inputShape: [seq],
+        outputUnits: tok.vocabSize,
+        attribution: attributionFor(id, stats, { level: "word", tokens: tok.tokens, seqLen: seq, padToken: ".", oovRate: tok.oovRate }),
+        tokenizer: {
+          level: "word",
+          tokens: tok.tokens.slice(),
+          seqLen: seq,
+          padToken: ".",
+          oovRate: tok.oovRate,
+        },
+      };
+      return packLmWindows(meta, ids, seq, REASON_MAX_WINDOWS, params);
+    }
     case "python_code": {
       const seq = PY_SEQ_LEN;
       const { text, stats } = buildPythonCorpus(params.seed + 31337);
@@ -570,6 +610,14 @@ function attributionFor(
   if ((id === "tiny_text_bpe" || id === "tiny_text_2_bpe") && tok && tok.level === "bpe") {
     const merges = tok.merges?.length ?? 0;
     return `Built-in corpus tokenised with BPE (${merges} learned merges, ${tok.tokens.length.toLocaleString()} tokens, ${tok.seqLen}-token context). The merge rules are saved with exported models, so the exported runtime tokenises exactly as this app does.`;
+  }
+  if (id === "reason_traces" && stats && tok) {
+    return (
+      `Deep reasoning (chain-of-thought) corpus: ${stats.chars.toLocaleString()} characters, ${stats.lines.toLocaleString()} question → thought → answer lines, ` +
+      `${stats.tokens.toLocaleString()} word tokens, ${stats.uniqueTokens.toLocaleString()} unique word types. ` +
+      `Tokenised at word level (${tok.tokens.length.toLocaleString()} tokens, ${tok.seqLen}-token context) so every trace fits in one window. ` +
+      `Generated locally in the browser — deterministic for a given seed. Tokenizer mapping is saved with exported models.`
+    );
   }
   if ((id === "nova_chat" || id === "python_code") && stats && tok && tok.level === "bpe") {
     const merges = tok.merges?.length ?? 0;

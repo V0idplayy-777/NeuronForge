@@ -24,6 +24,7 @@ export type LayerType =
   | "embedding"
   | "attention"
   | "transformer_block"
+  | "reasoning_block"
   | "rnn"
   | "lstm"
   | "gru"

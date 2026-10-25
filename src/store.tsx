@@ -423,15 +423,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Text and code models can have large optimizer state and attention workspaces.
       // Start with a bounded, device-sensitive batch and short smoke-test run;
       // users can increase epochs after confirming the run fits their device.
-      if (pr.category === "Text" || pr.category === "Code") {
+      if (pr.category === "Text" || pr.category === "Code" || pr.category === "Reasoning") {
         const parameterCount = new SequentialModel(archToLoad).paramCount().trainable;
         const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
         const cores = navigator.hardwareConcurrency || 4;
         const lowMemory = (deviceMemory !== undefined && deviceMemory <= 4) || cores <= 4;
         const batchSize = parameterCount >= 800_000 ? (lowMemory ? 1 : 2) : parameterCount >= 250_000 ? (lowMemory ? 2 : 4) : 8;
-        const epochs = Math.min(projectRef.current.trainingConfig.epochs, parameterCount >= 250_000 ? 3 : 5);
+        const epochs = Math.min(projectRef.current.trainingConfig.epochs, pr.category === "Reasoning" || parameterCount >= 250_000 ? 3 : 5);
         setTrainingConfig({ batchSize, epochs });
-        note += ` Safe starter run set to batch ${batchSize}, ${epochs} epochs for this ${parameterCount.toLocaleString()}-parameter text model; raise these gradually if your device has room.`;
+        note += ` Safe starter run set to batch ${batchSize}, ${epochs} epochs for this ${parameterCount.toLocaleString()}-parameter language model; raise these gradually if your device has room.`;
       }
       log("info", note);
       setView("builder");
@@ -546,7 +546,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             log("info", `Model vocabulary aligned to the dataset tokenizer: ${tok.tokens.length.toLocaleString()} ${tok.level} tokens, ${tok.seqLen} context. Changed layers were reinitialized.`);
           }
         } else {
-          log("warn", `Language dataset loaded (${tok.tokens.length.toLocaleString()} ${tok.level} tokens, context ${tok.seqLen}) but the current model has no Embedding layer. Load a Text preset to train it.`);
+          log("warn", `Language dataset loaded (${tok.tokens.length.toLocaleString()} ${tok.level} tokens, context ${tok.seqLen}) but the current model has no Embedding layer. Load a Text (or Reasoning) preset to train it.`);
         }
       }
     },

@@ -34,6 +34,7 @@ const LIBRARY: { type: LayerType; group: string }[] = [
   { type: "embedding", group: "Sequence" },
   { type: "attention", group: "Attention" },
   { type: "transformer_block", group: "Attention" },
+  { type: "reasoning_block", group: "Reasoning" },
   { type: "rnn", group: "Sequence" },
   { type: "lstm", group: "Sequence" },
   { type: "gru", group: "Sequence" },
@@ -51,6 +52,7 @@ const TONE: Record<string, string> = {
   embedding: "border-indigo-400/40 bg-indigo-500/10",
   attention: "border-pink-400/40 bg-pink-500/10",
   transformer_block: "border-pink-400/40 bg-pink-500/10",
+  reasoning_block: "border-orange-400/40 bg-orange-500/10",
   rnn: "border-sky-400/40 bg-sky-500/10",
   lstm: "border-blue-400/40 bg-blue-500/10",
   gru: "border-blue-400/40 bg-blue-500/10",
@@ -391,7 +393,7 @@ function LayerFields({ def, onChange }: { def: { type: LayerType; config: Record
         </Field>
       )}
       {"activation" in c && (
-        <Field label="Fused activation" hint={c.activation !== "none" ? ACTIVATION_DOCS[c.activation as ActivationName] : "Prefer a dedicated activation layer so you can inspect it."}>
+        <Field label={"steps" in c ? "Thought activation" : "Fused activation"} hint={c.activation !== "none" ? ACTIVATION_DOCS[c.activation as ActivationName] : "Prefer a dedicated activation layer so you can inspect it."}>
           <Select value={String(c.activation)} onChange={(e) => set("activation", e.target.value)}>
             <option value="none">none</option>
             {Object.keys(ACTIVATION_DOCS).map((a) => (
@@ -508,6 +510,47 @@ function LayerFields({ def, onChange }: { def: { type: LayerType; config: Record
       {"forgetBias" in c && (
         <Field label="Forget-gate bias" hint="Initial value of the forget gate's bias. 1.0 (default) keeps the cell state alive early in training; 0 makes the cell forget immediately.">
           <Input type="number" step={0.1} value={Number(c.forgetBias)} onChange={(e) => set("forgetBias", Number(e.target.value))} />
+        </Field>
+      )}
+      {"steps" in c && (
+        <Field label="Reasoning depth (steps)" hint="How many sequential deliberation steps one forward pass runs. The weights are shared across steps, so depth costs compute, not parameters. Exported models can override this at inference.">
+          <Input type="number" min={1} max={64} value={Number(c.steps)} onChange={(e) => set("steps", Math.max(1, Math.min(64, Number(e.target.value) || 1)))} />
+        </Field>
+      )}
+      {"hidden" in c && (
+        <Field label="Thought width" hint="Hidden width of the shared thought cell (width → hidden → width). 0 = 2 × the incoming feature width.">
+          <Input type="number" min={0} value={Number(c.hidden)} onChange={(e) => set("hidden", Math.max(0, Number(e.target.value) || 0))} />
+        </Field>
+      )}
+      {"adaptive" in c && (
+        <Field label="Adaptive halting" hint="At inference, stop early once cumulative halting confidence crosses the threshold. Training always runs every step so gradients see the full depth.">
+          <Select value={c.adaptive ? "1" : "0"} onChange={(e) => set("adaptive", e.target.value === "1")}>
+            <option value="1">On — stop when confident</option>
+            <option value="0">Off — always use full depth</option>
+          </Select>
+        </Field>
+      )}
+      {"haltThreshold" in c && (
+        <Field label="Halt threshold" hint="Cumulative halting probability that ends the loop early (0.99 = wait until 99% confident).">
+          <Input type="number" min={0.5} max={0.9999} step={0.005} value={Number(c.haltThreshold)} onChange={(e) => set("haltThreshold", Math.min(0.9999, Math.max(0.5, Number(e.target.value) || 0.99)))} />
+        </Field>
+      )}
+      {"minSteps" in c && (
+        <Field label="Minimum steps" hint="Never halt before this many steps, even if the halting head is confident.">
+          <Input type="number" min={1} max={64} value={Number(c.minSteps)} onChange={(e) => set("minSteps", Math.max(1, Number(e.target.value) || 1))} />
+        </Field>
+      )}
+      {"stepCode" in c && (
+        <Field label="Step signal" hint="Adds a parameter-free sinusoidal code for the step index, so step t is a different function from step t−1 and the cell keeps refining instead of reaching a fixed point.">
+          <Select value={c.stepCode ? "1" : "0"} onChange={(e) => set("stepCode", e.target.value === "1")}>
+            <option value="1">Sinusoidal step code</option>
+            <option value="0">None</option>
+          </Select>
+        </Field>
+      )}
+      {"stepCodeScale" in c && (
+        <Field label="Step-code scale" hint="Multiplier on the sinusoidal step signal.">
+          <Input type="number" step={0.1} value={Number(c.stepCodeScale)} onChange={(e) => set("stepCodeScale", Number(e.target.value))} />
         </Field>
       )}
       {"projection" in c && (

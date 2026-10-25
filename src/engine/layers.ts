@@ -20,6 +20,7 @@ import {
 import { initTensor } from "./init";
 import type { RNG } from "./rng";
 import { compileAttention, compileTransformerBlock, attentionOutputShape, attentionPlan, blockPlan } from "./attention";
+import { compileReasoningBlock, reasoningPlan, type ReasoningLayerInfo } from "./reasoning";
 
 export interface CompiledLayer {
   def: LayerDef;
@@ -32,6 +33,8 @@ export interface CompiledLayer {
   forward(x: Tensor, training: boolean): Tensor;
   backward(dy: Tensor): Tensor;
   resetCache(): void;
+  /** Present on Deep Reasoning blocks: the plan and the trace of the last forward pass. */
+  reasoning?: ReasoningLayerInfo;
 }
 
 export function defaultConfig(type: LayerType): Record<string, unknown> {
@@ -60,6 +63,18 @@ export function defaultConfig(type: LayerType): Record<string, unknown> {
       return { vocabSize: 32, embeddingDim: 8 };
     case "attention":
       return { heads: 4, dModel: 0, causal: true, useBias: true, dropout: 0, scale: 1, pool: "none" };
+    case "reasoning_block":
+      return {
+        steps: 8,
+        hidden: 0,
+        activation: "gelu",
+        adaptive: false,
+        haltThreshold: 0.99,
+        minSteps: 2,
+        stepCode: true,
+        stepCodeScale: 1,
+        epsilon: 1e-5,
+      };
     case "transformer_block":
       return {
         heads: 4,
@@ -113,6 +128,7 @@ export function layerDisplayName(type: LayerType): string {
     embedding: "Embedding",
     attention: "Multi-Head Attention",
     transformer_block: "Transformer Block",
+    reasoning_block: "Deep Reasoning",
     rnn: "RNN",
     lstm: "LSTM",
     gru: "GRU",
@@ -204,6 +220,10 @@ export function inferOutputShape(type: LayerType, config: Record<string, unknown
       return attentionOutputShape(attentionPlan(config, inputShape), inputShape[0]!);
     case "transformer_block":
       return attentionOutputShape(blockPlan(config, inputShape), inputShape[0]!);
+    case "reasoning_block": {
+      const rp = reasoningPlan(config, inputShape);
+      return [rp.width];
+    }
     case "rnn": {
       if (inputShape.length !== 2) {
         throw new Error(`RNN expects a sequence [seqLen, features] (e.g. from an Embedding), got ${shapeStr(inputShape)}`);
@@ -324,6 +344,8 @@ export function compileLayer(
       return compileAttention(def, inputShape, rng, existing, frozen);
     case "transformer_block":
       return compileTransformerBlock(def, inputShape, rng, existing, frozen);
+    case "reasoning_block":
+      return compileReasoningBlock(def, inputShape, rng, defaultInit, existing, frozen);
     case "rnn":
       return compileRnn(def, inputShape, outputShape, rng, existing, frozen);
     case "lstm":
@@ -2010,6 +2032,7 @@ export const LAYER_DOCS: Record<LayerType, string> = {
   embedding: "Maps integer token indices to dense vectors. Used for discrete / language inputs.",
   attention: "Multi-head self-attention over a sequence [T, features]: every position builds a query, key and value vector, scores each pair with a scaled dot-product, softmaxes the scores and mixes the values. Causal masking keeps position t from seeing the future, which is what makes next-token prediction honest. Pool 'last' hands the final position to the next layer (GPT-style), 'mean' averages all positions, 'none' returns the whole sequence. When the input width differs from dModel a learned input projection is added. Attention has no notion of order by itself — that is why it is usually fed by an Embedding inside a Transformer Block.",
   transformer_block: "A complete pre-LayerNorm transformer block: x + MultiHeadAttention(LayerNorm(x)), then x + FFN(LayerNorm(x)) where FFN is a two-layer MLP (dModel → ffDim → dModel) with GELU by default. This is the repeating unit of GPT-style models: attention moves information between positions, the feed-forward network transforms each position on its own, and the two residual paths keep gradients alive through depth.",
+  reasoning_block: "Deep Reasoning: adaptive-depth latent deliberation on a flat vector. One shared-weight thought cell is applied for `steps` iterations — LayerNorm → sinusoidal step code → GELU MLP → gated residual write — with a halting head that decides when more thought is unnecessary. Depth costs compute, not parameters, so the same ~40k model can think for 8 steps in training and more (or fewer) at inference. The exported runtimes keep the loop and expose the per-step halting trace through model.reason(). Pool a sequence first (Attention / Transformer Block with output 'last') or add Flatten.",
   rnn: "Simple tanh RNN with full backpropagation through time. Processes a sequence step by step and carries a hidden state. Long contexts can suffer vanishing gradients — that is a real property of this architecture, not a bug.",
   lstm: "Long short-term memory cell with input/forget/output gates and a cell state. Full backpropagation through time. The forget-gate bias starts at 1 so gradients keep a path across long sequences — the reason LSTMs hold context where a plain tanh RNN decays.",
   gru: "Gated recurrent unit: update and reset gates, no separate cell state. Fewer parameters than an LSTM and a single hidden state; usually the first gate to try on a new sequence task.",
